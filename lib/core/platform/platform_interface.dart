@@ -8,6 +8,7 @@ import '/core/models/audio/waveform_chunk_model.dart';
 import '/core/models/audio/waveform_configs_model.dart';
 import '/core/models/audio/waveform_data_model.dart';
 import '/core/models/platform/native_log_level.dart';
+import '/core/models/platform/video_editor_capabilities.dart';
 import '/core/models/thumbnail/key_frames_configs_model.dart';
 import '/core/models/thumbnail/single_thumbnail_configs_model.dart';
 import '/core/models/thumbnail/thumbnail_configs_model.dart';
@@ -82,6 +83,16 @@ abstract class ProVideoEditor extends PlatformInterface {
   /// Throws an [UnimplementedError] if not implemented.
   Future<String?> getPlatformVersion() {
     throw UnimplementedError('platformVersion() has not been implemented.');
+  }
+
+  /// Returns the feature support matrix for the current platform.
+  ///
+  /// Use this before calling platform-sensitive APIs when your app supports
+  /// multiple target platforms.
+  Future<VideoEditorCapabilities> getSupportedFeatures() {
+    throw UnimplementedError(
+      'getSupportedFeatures() has not been implemented.',
+    );
   }
 
   /// Retrieves detailed metadata about the given video.

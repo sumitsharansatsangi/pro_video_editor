@@ -8,6 +8,9 @@ import 'dart:typed_data';
 
 import 'package:flutter_web_plugins/flutter_web_plugins.dart';
 import 'package:pro_video_editor/core/models/audio/audio_extract_configs_model.dart';
+import 'package:pro_video_editor/core/models/exceptions/unsupported_feature_exception.dart';
+import 'package:pro_video_editor/core/models/platform/video_editor_capabilities.dart';
+import 'package:pro_video_editor/core/models/platform/video_editor_feature.dart';
 import 'package:pro_video_editor/core/models/video/progress_model.dart';
 import 'package:web/web.dart' as web;
 
@@ -58,6 +61,19 @@ class ProVideoEditorWeb extends ProVideoEditor {
   }
 
   @override
+  Future<VideoEditorCapabilities> getSupportedFeatures() async {
+    return const VideoEditorCapabilities(
+      platform: 'web',
+      supportedFeatures: {
+        VideoEditorFeature.metadata,
+        VideoEditorFeature.thumbnails,
+        VideoEditorFeature.keyFrames,
+        VideoEditorFeature.singleThumbnail,
+      },
+    );
+  }
+
+  @override
   Future<VideoMetadata> getMetadata(
     EditorVideo value, {
     bool checkStreamingOptimization = false,
@@ -72,8 +88,7 @@ class ProVideoEditorWeb extends ProVideoEditor {
     EditorVideo value, {
     NativeLogLevel? nativeLogLevel,
   }) {
-    throw UnimplementedError(
-        'hasAudioTrack() has not been implemented on web.');
+    throw _unsupported(VideoEditorFeature.hasAudioTrack);
   }
 
   @override
@@ -105,7 +120,8 @@ class ProVideoEditorWeb extends ProVideoEditor {
   }) async {
     Duration timestamp;
     if (value.position == ThumbnailPosition.last) {
-      final duration = value.videoDuration ??
+      final duration =
+          value.videoDuration ??
           (await _manager.getMetadata(value.video)).duration;
       timestamp = duration;
     } else {
@@ -134,7 +150,7 @@ class ProVideoEditorWeb extends ProVideoEditor {
     AudioExtractConfigs value, {
     NativeLogLevel? nativeLogLevel,
   }) {
-    throw UnimplementedError('extractAudio() has not been implemented on web.');
+    throw _unsupported(VideoEditorFeature.extractAudio);
   }
 
   @override
@@ -143,8 +159,7 @@ class ProVideoEditorWeb extends ProVideoEditor {
     AudioExtractConfigs value, {
     NativeLogLevel? nativeLogLevel,
   }) {
-    throw UnimplementedError(
-        'extractAudioToFile() has not been implemented on web.');
+    throw _unsupported(VideoEditorFeature.extractAudioToFile);
   }
 
   @override
@@ -152,7 +167,7 @@ class ProVideoEditorWeb extends ProVideoEditor {
     VideoRenderData value, {
     NativeLogLevel? nativeLogLevel,
   }) {
-    throw UnimplementedError('renderVideo() has not been implemented.');
+    throw _unsupported(VideoEditorFeature.renderVideo);
   }
 
   @override
@@ -161,12 +176,12 @@ class ProVideoEditorWeb extends ProVideoEditor {
     VideoRenderData value, {
     NativeLogLevel? nativeLogLevel,
   }) {
-    throw UnimplementedError('renderVideoToFile() has not been implemented.');
+    throw _unsupported(VideoEditorFeature.renderVideoToFile);
   }
 
   @override
   Future<void> cancel(String taskId) {
-    throw UnimplementedError('cancel() has not been implemented.');
+    throw _unsupported(VideoEditorFeature.cancel);
   }
 
   @override
@@ -183,5 +198,9 @@ class ProVideoEditorWeb extends ProVideoEditor {
   /// [progress] Progress value between 0.0 and 1.0.
   void _updateProgress(String taskId, double progress) {
     progressCtrl.add(ProgressModel(id: taskId, progress: progress));
+  }
+
+  UnsupportedFeatureException _unsupported(VideoEditorFeature feature) {
+    return UnsupportedFeatureException(feature: feature, platform: 'web');
   }
 }

@@ -4,7 +4,10 @@ import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
 import 'package:mime/mime.dart';
 import 'package:pro_video_editor/core/models/exceptions/audio_exceptions.dart';
+import 'package:pro_video_editor/core/models/exceptions/unsupported_feature_exception.dart';
 import 'package:pro_video_editor/core/models/platform/native_log_level.dart';
+import 'package:pro_video_editor/core/models/platform/video_editor_capabilities.dart';
+import 'package:pro_video_editor/core/models/platform/video_editor_feature.dart';
 
 import '/core/models/audio/audio_extract_configs_model.dart';
 import '/core/models/audio/waveform_chunk_model.dart';
@@ -80,23 +83,84 @@ class MethodChannelProVideoEditor extends ProVideoEditor {
   }
 
   @override
+  Future<VideoEditorCapabilities> getSupportedFeatures() async {
+    final platform = Platform.operatingSystem;
+
+    if (Platform.isAndroid || Platform.isIOS || Platform.isMacOS) {
+      return VideoEditorCapabilities(
+        platform: platform,
+        supportedFeatures: const {
+          VideoEditorFeature.metadata,
+          VideoEditorFeature.hasAudioTrack,
+          VideoEditorFeature.thumbnails,
+          VideoEditorFeature.keyFrames,
+          VideoEditorFeature.singleThumbnail,
+          VideoEditorFeature.renderVideo,
+          VideoEditorFeature.renderVideoToFile,
+          VideoEditorFeature.cancel,
+          VideoEditorFeature.extractAudio,
+          VideoEditorFeature.extractAudioToFile,
+          VideoEditorFeature.waveform,
+          VideoEditorFeature.waveformStreaming,
+          VideoEditorFeature.rotate,
+          VideoEditorFeature.flip,
+          VideoEditorFeature.crop,
+          VideoEditorFeature.scale,
+          VideoEditorFeature.trim,
+          VideoEditorFeature.mergeVideos,
+          VideoEditorFeature.playbackSpeed,
+          VideoEditorFeature.muteAudio,
+          VideoEditorFeature.imageLayers,
+          VideoEditorFeature.timedImageLayers,
+          VideoEditorFeature.layerAnimations,
+          VideoEditorFeature.colorFilters,
+          VideoEditorFeature.customAudioTracks,
+          VideoEditorFeature.streamingOptimization,
+        },
+        experimentalFeatures: const {VideoEditorFeature.blur},
+      );
+    }
+
+    if (Platform.isWindows) {
+      return VideoEditorCapabilities(
+        platform: platform,
+        supportedFeatures: const {VideoEditorFeature.metadata},
+      );
+    }
+
+    if (Platform.isLinux) {
+      return VideoEditorCapabilities(
+        platform: platform,
+        experimentalFeatures: const {VideoEditorFeature.metadata},
+      );
+    }
+
+    return VideoEditorCapabilities(
+      platform: platform.isEmpty ? 'unknown' : platform,
+      supportedFeatures: const {},
+    );
+  }
+
+  @override
   Future<VideoMetadata> getMetadata(
     EditorVideo value, {
     bool checkStreamingOptimization = false,
     NativeLogLevel? nativeLogLevel,
   }) async {
+    await _ensureFeatureSupported(VideoEditorFeature.metadata);
+
     var inputPath = await value.safeFilePath();
 
     var extension = _getFileExtension(inputPath);
 
     final response =
         await methodChannel.invokeMethod<Map<dynamic, dynamic>>('getMetadata', {
-              'inputPath': inputPath,
-              'extension': extension,
-              'checkStreamingOptimization': checkStreamingOptimization,
-              'nativeLogLevel': nativeLogLevel?.methodValue,
-            }) ??
-            {};
+          'inputPath': inputPath,
+          'extension': extension,
+          'checkStreamingOptimization': checkStreamingOptimization,
+          'nativeLogLevel': nativeLogLevel?.methodValue,
+        }) ??
+        {};
 
     return VideoMetadata.fromMap(response, extension);
   }
@@ -106,6 +170,8 @@ class MethodChannelProVideoEditor extends ProVideoEditor {
     EditorVideo value, {
     NativeLogLevel? nativeLogLevel,
   }) async {
+    await _ensureFeatureSupported(VideoEditorFeature.hasAudioTrack);
+
     var inputPath = await value.safeFilePath();
 
     final result = await methodChannel.invokeMethod<bool>('hasAudioTrack', {
@@ -123,13 +189,13 @@ class MethodChannelProVideoEditor extends ProVideoEditor {
   }) async {
     var inputPath = await value.video.safeFilePath();
 
-    final response =
-        await methodChannel.invokeMethod<List<dynamic>>('getThumbnails', {
-      'inputPath': inputPath,
-      'extension': _getFileExtension(inputPath),
-      'nativeLogLevel': nativeLogLevel?.methodValue,
-      ...value.toMap(),
-    });
+    final response = await methodChannel
+        .invokeMethod<List<dynamic>>('getThumbnails', {
+          'inputPath': inputPath,
+          'extension': _getFileExtension(inputPath),
+          'nativeLogLevel': nativeLogLevel?.methodValue,
+          ...value.toMap(),
+        });
     final List<Uint8List> result = response?.cast<Uint8List>() ?? [];
 
     return result;
@@ -140,6 +206,8 @@ class MethodChannelProVideoEditor extends ProVideoEditor {
     ThumbnailConfigs value, {
     NativeLogLevel? nativeLogLevel,
   }) async {
+    await _ensureFeatureSupported(VideoEditorFeature.thumbnails);
+
     return await _extractThumbnails(value, nativeLogLevel: nativeLogLevel);
   }
 
@@ -148,6 +216,8 @@ class MethodChannelProVideoEditor extends ProVideoEditor {
     KeyFramesConfigs value, {
     NativeLogLevel? nativeLogLevel,
   }) async {
+    await _ensureFeatureSupported(VideoEditorFeature.keyFrames);
+
     return await _extractThumbnails(value, nativeLogLevel: nativeLogLevel);
   }
 
@@ -156,12 +226,17 @@ class MethodChannelProVideoEditor extends ProVideoEditor {
     SingleThumbnailConfigs value, {
     NativeLogLevel? nativeLogLevel,
   }) async {
+    await _ensureFeatureSupported(VideoEditorFeature.singleThumbnail);
+
     final bool isLastFrame = value.position == ThumbnailPosition.last;
     Duration timestamp;
     if (isLastFrame) {
-      final duration = value.videoDuration ??
-          (await getMetadata(value.video, nativeLogLevel: nativeLogLevel))
-              .duration;
+      final duration =
+          value.videoDuration ??
+          (await getMetadata(
+            value.video,
+            nativeLogLevel: nativeLogLevel,
+          )).duration;
       timestamp = duration;
     } else {
       timestamp = Duration.zero;
@@ -189,16 +264,18 @@ class MethodChannelProVideoEditor extends ProVideoEditor {
     AudioExtractConfigs value, {
     NativeLogLevel? nativeLogLevel,
   }) async {
+    await _ensureFeatureSupported(VideoEditorFeature.extractAudio);
+
     try {
       var inputPath = await value.video.safeFilePath();
 
-      final Uint8List? result =
-          await methodChannel.invokeMethod<Uint8List>('extractAudio', {
-        'inputPath': inputPath,
-        'extension': _getFileExtension(inputPath),
-        'nativeLogLevel': nativeLogLevel?.methodValue,
-        ...value.toMap(),
-      });
+      final Uint8List? result = await methodChannel
+          .invokeMethod<Uint8List>('extractAudio', {
+            'inputPath': inputPath,
+            'extension': _getFileExtension(inputPath),
+            'nativeLogLevel': nativeLogLevel?.methodValue,
+            ...value.toMap(),
+          });
 
       if (result == null) {
         throw ArgumentError('Failed to extract audio from video');
@@ -221,6 +298,8 @@ class MethodChannelProVideoEditor extends ProVideoEditor {
     AudioExtractConfigs value, {
     NativeLogLevel? nativeLogLevel,
   }) async {
+    await _ensureFeatureSupported(VideoEditorFeature.extractAudioToFile);
+
     try {
       var inputPath = await value.video.safeFilePath();
 
@@ -248,16 +327,18 @@ class MethodChannelProVideoEditor extends ProVideoEditor {
     WaveformConfigs value, {
     NativeLogLevel? nativeLogLevel,
   }) async {
+    await _ensureFeatureSupported(VideoEditorFeature.waveform);
+
     try {
       var inputPath = await value.video.safeFilePath();
 
       final response = await methodChannel
           .invokeMethod<Map<dynamic, dynamic>>('getWaveform', {
-        'inputPath': inputPath,
-        'extension': _getFileExtension(inputPath),
-        'nativeLogLevel': nativeLogLevel?.methodValue,
-        ...value.toMap(),
-      });
+            'inputPath': inputPath,
+            'extension': _getFileExtension(inputPath),
+            'nativeLogLevel': nativeLogLevel?.methodValue,
+            ...value.toMap(),
+          });
 
       if (response == null) {
         throw ArgumentError('Failed to generate waveform data');
@@ -279,6 +360,8 @@ class MethodChannelProVideoEditor extends ProVideoEditor {
     WaveformConfigs value, {
     NativeLogLevel? nativeLogLevel,
   }) async* {
+    await _ensureFeatureSupported(VideoEditorFeature.waveformStreaming);
+
     // Get the input path before starting the stream
     final inputPath = await value.video.safeFilePath();
     final extension = _getFileExtension(inputPath);
@@ -368,15 +451,14 @@ class MethodChannelProVideoEditor extends ProVideoEditor {
     VideoRenderData value, {
     NativeLogLevel? nativeLogLevel,
   }) async {
+    await _ensureFeatureSupported(VideoEditorFeature.renderVideo);
+
     try {
       final renderData = await value.toAsyncMap();
 
       final Uint8List? result = await methodChannel.invokeMethod<Uint8List>(
         'renderVideo',
-        {
-          ...renderData,
-          'nativeLogLevel': nativeLogLevel?.methodValue,
-        },
+        {...renderData, 'nativeLogLevel': nativeLogLevel?.methodValue},
       );
 
       if (result == null) {
@@ -398,6 +480,8 @@ class MethodChannelProVideoEditor extends ProVideoEditor {
     VideoRenderData value, {
     NativeLogLevel? nativeLogLevel,
   }) async {
+    await _ensureFeatureSupported(VideoEditorFeature.renderVideoToFile);
+
     try {
       final renderData = await value.toAsyncMap();
 
@@ -422,6 +506,8 @@ class MethodChannelProVideoEditor extends ProVideoEditor {
       throw ArgumentError('taskId cannot be empty');
     }
 
+    await _ensureFeatureSupported(VideoEditorFeature.cancel);
+
     await methodChannel.invokeMethod<void>('cancelTask', {'id': taskId});
   }
 
@@ -431,15 +517,18 @@ class MethodChannelProVideoEditor extends ProVideoEditor {
     if (!kIsWeb && (Platform.isWindows || Platform.isLinux)) return;
 
     // Subscribe to native progress events
-    _progressChannel.receiveBroadcastStream().map((event) {
-      try {
-        return ProgressModel.fromMap(event);
-      } catch (e, stack) {
-        // Log parsing errors but don't crash - return error progress
-        debugPrint('Error parsing progress event: $e\n$stack');
-        return const ProgressModel(id: 'error', progress: 0);
-      }
-    }).listen(progressCtrl.add);
+    _progressChannel
+        .receiveBroadcastStream()
+        .map((event) {
+          try {
+            return ProgressModel.fromMap(event);
+          } catch (e, stack) {
+            // Log parsing errors but don't crash - return error progress
+            debugPrint('Error parsing progress event: $e\n$stack');
+            return const ProgressModel(id: 'error', progress: 0);
+          }
+        })
+        .listen(progressCtrl.add);
   }
 
   /// Extracts file extension from path using MIME type detection.
@@ -458,5 +547,15 @@ class MethodChannelProVideoEditor extends ProVideoEditor {
     var extension = mimeSp.length == 2 ? mimeSp[1] : 'mp4';
 
     return extension;
+  }
+
+  Future<void> _ensureFeatureSupported(VideoEditorFeature feature) async {
+    final capabilities = await getSupportedFeatures();
+    if (capabilities.supports(feature)) return;
+
+    throw UnsupportedFeatureException(
+      feature: feature,
+      platform: capabilities.platform,
+    );
   }
 }
