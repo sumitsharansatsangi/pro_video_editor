@@ -4,6 +4,7 @@ version: 1.16.0
 homepage: https://github.com/hm21/pro_video_editor/
 repository: https://github.com/hm21/pro_video_editor/
 documentation: https://github.com/hm21/pro_video_editor/
+publish_to: none
 funding:
   - https://github.com/sponsors/hm21
 
@@ -21,18 +22,21 @@ screenshots:
     path: assets/showcase1.jpg
 
 environment:
-  sdk: '>=3.4.0 <4.0.0'
-  flutter: ">=3.35.0"
+  sdk: '>=3.11.0 <4.0.0'
+  flutter: ">=3.41.0"
 
 dependencies:
   flutter:
     sdk: flutter
   flutter_web_plugins:
     sdk: flutter
- 
   path_provider: ^2.1.5
   plugin_platform_interface: ^2.1.8
-  http: ^1.4.0
+  # path_provider: 
+  #   git: https://github.com/kumsumit/path_provider.git
+  # plugin_platform_interface: 
+  #   git: https://github.com/kumsumit/plugin_platform_interface.git
+  http: ^1.6.0
   mime: ^2.0.0
   web: ^1.1.1
 
@@ -40,10 +44,10 @@ dev_dependencies:
   flutter_test:
     sdk: flutter
     
-  build_runner: ^2.4.8
-  flutter_lints: ^5.0.0
-  import_sorter: ^4.6.0
-  mockito: ^5.4.6
+  build_runner: ^2.15.0
+  flutter_lints: ^6.0.0
+  import_sorter: ^5.0.0-releasecandidate.1
+  mockito: ^5.6.4
   network_image_mock: ^2.1.1
 
 flutter:

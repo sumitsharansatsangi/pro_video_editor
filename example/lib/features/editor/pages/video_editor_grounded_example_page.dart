@@ -703,7 +703,7 @@ class _VideoEditorGroundedExamplePageState
   ).floor();
   Future<VideoClip?> _addClip() async {
     // Open video picker
-    final result = await FilePicker.platform.pickFiles(
+    final result = await FilePicker.pickFiles(
       type: FileType.video,
       allowMultiple: false,
     );

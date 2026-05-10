@@ -18,29 +18,38 @@ dependencies:
 
   pro_image_editor: ^12.4.3
   
-  google_fonts: ^6.3.2
+  google_fonts: ^8.1.0
   flutter_colorpicker: ^1.1.0
-  file_picker: ^10.2.1
+  file_picker: ^11.0.2
   mime: ^2.0.0
   wav: 1.5.0
 
   path_provider: ^2.1.5
-  video_player: ^2.9.3
-  audioplayers: ^5.2.1
+  video_player: ^2.11.1
+  audioplayers: ^6.6.0
   # Optional multiplatform video player
-  media_kit: ^1.1.11 # Primary package.
-  media_kit_video: ^1.2.5 # For video rendering.
-  media_kit_libs_video: ^1.0.5 # Native video dependencies.
+  media_kit: ^1.2.6 # Primary package.
+  media_kit_video: ^2.0.1 # For video rendering.
+  media_kit_libs_video: ^1.0.7 # Native video dependencies.
 
 dev_dependencies:
   integration_test:
     sdk: flutter
   flutter_test:
     sdk: flutter
- 
   flutter_lints: ^6.0.0
  
-
+dependency_overrides:
+  media_kit:
+    git: "https://github.com/kumsumit/media_kit.git"
+  media_kit_libs_video:
+    git: "https://github.com/kumsumit/media_kit_libs_video.git"
+  media_kit_video:
+    git: "https://github.com/kumsumit/media_kit_video.git"
+  plugin_platform_interface:
+    git: "https://github.com/kumsumit/plugin_platform_interface.git"
+  file_picker:
+    git: "https://github.com/sumitsharansatsangi/flutter_file_picker"
 flutter:
   uses-material-design: true
   assets:

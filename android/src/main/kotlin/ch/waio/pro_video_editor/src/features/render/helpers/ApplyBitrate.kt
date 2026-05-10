@@ -35,8 +35,16 @@ fun applyBitrate(
     }
 
     val capabilities = codecInfo.getCapabilitiesForType(mimeType)
-    val bitrateRange = capabilities.videoCapabilities.bitrateRange
-    val supportsCBR = capabilities.encoderCapabilities
+    val videoCapabilities = capabilities.videoCapabilities
+    val encoderCapabilities = capabilities.encoderCapabilities
+
+    if (videoCapabilities == null || encoderCapabilities == null) {
+        Log.e(RENDER_TAG, "Encoder capabilities unavailable for $mimeType")
+        return
+    }
+
+    val bitrateRange = videoCapabilities.bitrateRange
+    val supportsCBR = encoderCapabilities
         .isBitrateModeSupported(MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_CBR)
 
     if (!bitrateRange.contains(bitrate)) {
