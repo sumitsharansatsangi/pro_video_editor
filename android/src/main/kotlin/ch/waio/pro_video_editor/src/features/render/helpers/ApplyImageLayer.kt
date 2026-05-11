@@ -77,7 +77,7 @@ fun applyTimedImageLayers(
         RENDER_TAG,
         "Applying ${imageLayers.size} time-based image layer(s) to ${videoWidth}x$videoHeight video"
     )
-    for (layer in imageLayers) {
+    for (layer in imageLayers.sortedBy { it.zIndex }) {
         try {
             val imageBytes = layer.imageBytes ?: continue
             val options = BitmapFactory.Options().apply {
@@ -117,6 +117,8 @@ fun applyTimedImageLayers(
                 overlaySettings = StaticOverlaySettings.Builder()
                     .setOverlayFrameAnchor(0f, 0f)
                     .setBackgroundFrameAnchor(0f, 0f)
+                    .setAlphaScale(layer.opacity)
+                    .setRotationDegrees(layer.rotation)
                     .build()
 
                 Log.d(RENDER_TAG, "Layer: stretched to ${videoWidth}x$videoHeight")
@@ -135,14 +137,20 @@ fun applyTimedImageLayers(
                 // Use OverlaySettings for positioning
                 // Media3 uses OpenGL coordinates: x[-1,1] left→right, y[-1,1] bottom→top.
                 // Input uses top-left origin, so y must be flipped.
-                val centerX = x.toFloat() + imageWidth / 2f
-                val centerY = y.toFloat() + imageHeight / 2f
-                baseNormX = (centerX / videoWidth) * 2f - 1f
-                baseNormY = 1f - (centerY / videoHeight) * 2f
+                val anchorX = layer.anchorX ?: 0.5f
+                val anchorY = layer.anchorY ?: 0.5f
+                val anchorPixelX = x.toFloat() + imageWidth * anchorX
+                val anchorPixelY = y.toFloat() + imageHeight * anchorY
+                baseNormX = (anchorPixelX / videoWidth) * 2f - 1f
+                baseNormY = 1f - (anchorPixelY / videoHeight) * 2f
+                val overlayAnchorX = anchorX * 2f - 1f
+                val overlayAnchorY = 1f - anchorY * 2f
 
                 overlaySettings = StaticOverlaySettings.Builder()
                     .setBackgroundFrameAnchor(baseNormX, baseNormY)
-                    .setOverlayFrameAnchor(0f, 0f)
+                    .setOverlayFrameAnchor(overlayAnchorX, overlayAnchorY)
+                    .setAlphaScale(layer.opacity)
+                    .setRotationDegrees(layer.rotation)
                     .build()
 
                 Log.d(
@@ -177,7 +185,11 @@ fun applyTimedImageLayers(
                     videoHeight = videoHeight,
                     layerStartUs = startTimeUs,
                     layerEndUs = endTimeUs,
-                    animations = layer.animations
+                    animations = layer.animations,
+                    rotation = layer.rotation,
+                    opacity = layer.opacity,
+                    anchorX = layer.anchorX ?: 0.5f,
+                    anchorY = layer.anchorY ?: 0.5f
                 )
                 Log.d(RENDER_TAG, "Layer: using AnimatedBitmapOverlay with ${layer.animations.size} animation(s)")
             } else {

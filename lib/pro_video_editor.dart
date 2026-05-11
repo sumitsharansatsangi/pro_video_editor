@@ -14,6 +14,7 @@ export 'features/audio/models/waveform_style.dart';
 export 'core/models/image/editor_layer_image_model.dart';
 export 'core/models/image/image_layer_model.dart';
 export 'core/models/image/layer_animation_model.dart';
+export 'core/models/video/blur_filter_model.dart';
 export 'core/models/video/color_filter_model.dart';
 export 'core/models/video/progress_model.dart';
 export 'core/models/video/editor_video_model.dart';
@@ -32,7 +33,9 @@ export 'shared/utils/converters.dart';
 
 /// Thumbnails
 export 'core/models/thumbnail/key_frames_configs_model.dart';
+export 'core/models/thumbnail/frame_thumbnail_configs_model.dart';
 export 'core/models/thumbnail/single_thumbnail_configs_model.dart';
 export 'core/models/thumbnail/thumbnail_box_fit_model.dart';
 export 'core/models/thumbnail/thumbnail_configs_model.dart';
 export 'core/models/thumbnail/thumbnail_format_model.dart';
+export 'core/utils/video_timeline_utils.dart';

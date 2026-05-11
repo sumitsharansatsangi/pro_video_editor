@@ -49,6 +49,29 @@ data class ColorFilterConfig(
 }
 
 /**
+ * Represents a blur effect with optional time range.
+ *
+ * @property blur Blur intensity
+ * @property startUs Start time in microseconds when the blur should be active
+ * @property endUs End time in microseconds when the blur should stop
+ */
+data class BlurFilterConfig(
+    val blur: Double,
+    val startUs: Long?,
+    val endUs: Long?
+) {
+    companion object {
+        fun fromMap(map: Map<String, Any?>): BlurFilterConfig {
+            return BlurFilterConfig(
+                blur = (map["blur"] as? Number)?.toDouble() ?: 0.0,
+                startUs = (map["startUs"] as? Number)?.toLong(),
+                endUs = (map["endUs"] as? Number)?.toLong()
+            )
+        }
+    }
+}
+
+/**
  * Represents a custom audio track with timing and volume configuration.
  *
  * @property path Absolute path to the audio file
@@ -126,6 +149,12 @@ data class LayerAnimationConfig(
  * @property width Target width in pixels (null = original width)
  * @property height Target height in pixels (null = original height)
  * @property animations List of animations to apply to this layer
+ * @property rotation Clockwise rotation in degrees
+ * @property opacity Layer opacity from 0.0 to 1.0
+ * @property zIndex Draw order. Higher values render above lower values.
+ * @property anchorX Normalized horizontal anchor point (0.0 left, 1.0 right)
+ * @property anchorY Normalized vertical anchor point (0.0 top, 1.0 bottom)
+ * @property blendMode Blend mode intent. Android currently uses source-over.
  */
 data class ImageLayer(
     val imageData: ByteArray,
@@ -135,7 +164,13 @@ data class ImageLayer(
     val y: Int? = null,
     val width: Double? = null,
     val height: Double? = null,
-    val animations: List<LayerAnimationConfig> = emptyList()
+    val animations: List<LayerAnimationConfig> = emptyList(),
+    val rotation: Float = 0f,
+    val opacity: Float = 1f,
+    val zIndex: Int = 0,
+    val anchorX: Float? = null,
+    val anchorY: Float? = null,
+    val blendMode: String = "sourceOver"
 ) {
     override fun equals(other: Any?): Boolean {
         if (this === other) return true
@@ -148,7 +183,13 @@ data class ImageLayer(
                 y == other.y &&
                 width == other.width &&
                 height == other.height &&
-                animations == other.animations
+                animations == other.animations &&
+                rotation == other.rotation &&
+                opacity == other.opacity &&
+                zIndex == other.zIndex &&
+                anchorX == other.anchorX &&
+                anchorY == other.anchorY &&
+                blendMode == other.blendMode
     }
 
     override fun hashCode(): Int {
@@ -160,6 +201,12 @@ data class ImageLayer(
         result = 31 * result + (width?.hashCode() ?: 0)
         result = 31 * result + (height?.hashCode() ?: 0)
         result = 31 * result + animations.hashCode()
+        result = 31 * result + rotation.hashCode()
+        result = 31 * result + opacity.hashCode()
+        result = 31 * result + zIndex.hashCode()
+        result = 31 * result + (anchorX?.hashCode() ?: 0)
+        result = 31 * result + (anchorY?.hashCode() ?: 0)
+        result = 31 * result + blendMode.hashCode()
         return result
     }
 }
@@ -182,6 +229,7 @@ data class RenderConfig(
     val enableAudio: Boolean = true,
     val playbackSpeed: Float? = null,
     val colorFilters: List<ColorFilterConfig> = emptyList(),
+    val blurFilters: List<BlurFilterConfig> = emptyList(),
     val audioTracks: List<AudioTrackConfig> = emptyList(),
     val blur: Double? = null,
     /** Global start time in microseconds for trimming the final composition */
@@ -253,6 +301,13 @@ data class RenderConfig(
                 val y = (layerMap["y"] as? Number)?.toInt()
                 val width = (layerMap["width"] as? Number)?.toDouble()
                 val height = (layerMap["height"] as? Number)?.toDouble()
+                val rotation = (layerMap["rotation"] as? Number)?.toFloat() ?: 0f
+                val opacity = (layerMap["opacity"] as? Number)?.toFloat()?.coerceIn(0f, 1f)
+                    ?: 1f
+                val zIndex = (layerMap["zIndex"] as? Number)?.toInt() ?: 0
+                val anchorX = (layerMap["anchorX"] as? Number)?.toFloat()
+                val anchorY = (layerMap["anchorY"] as? Number)?.toFloat()
+                val blendMode = layerMap["blendMode"] as? String ?: "sourceOver"
 
                 // Parse animations
                 @Suppress("UNCHECKED_CAST")
@@ -262,9 +317,24 @@ data class RenderConfig(
                 if (imageData == null || imageData.isEmpty()) {
                     null
                 } else {
-                    ImageLayer(imageData, startUs, endUs, x, y, width, height, animations)
+                    ImageLayer(
+                        imageData,
+                        startUs,
+                        endUs,
+                        x,
+                        y,
+                        width,
+                        height,
+                        animations,
+                        rotation,
+                        opacity,
+                        zIndex,
+                        anchorX,
+                        anchorY,
+                        blendMode
+                    )
                 }
-            } ?: emptyList()
+            }?.sortedBy { it.zIndex } ?: emptyList()
 
             Log.d(PACKAGE_TAG, "Parsed ${imageLayers.size} image layer(s)")
 
@@ -273,6 +343,12 @@ data class RenderConfig(
             val colorFiltersRaw = call.argument<List<Map<String, Any?>>>("colorFilters")
             val colorFilters = colorFiltersRaw?.map { ColorFilterConfig.fromMap(it) } ?: emptyList()
             Log.d(PACKAGE_TAG, "Parsed ${colorFilters.size} color filter(s)")
+
+            // Parse blur filters
+            @Suppress("UNCHECKED_CAST")
+            val blurFiltersRaw = call.argument<List<Map<String, Any?>>>("blurFilters")
+            val blurFilters = blurFiltersRaw?.map { BlurFilterConfig.fromMap(it) } ?: emptyList()
+            Log.d(PACKAGE_TAG, "Parsed ${blurFilters.size} blur filter(s)")
 
             // Parse audio tracks
             @Suppress("UNCHECKED_CAST")
@@ -299,6 +375,7 @@ data class RenderConfig(
                 enableAudio = call.argument<Boolean>("enableAudio") ?: true,
                 playbackSpeed = call.argument<Number>("playbackSpeed")?.toFloat(),
                 colorFilters = colorFilters,
+                blurFilters = blurFilters,
                 audioTracks = audioTracks,
                 blur = call.argument<Number>("blur")?.toDouble(),
                 startUs = call.argument<Number?>("startUs")?.toLong(),

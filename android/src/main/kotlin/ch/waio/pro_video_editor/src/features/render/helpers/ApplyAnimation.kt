@@ -76,7 +76,11 @@ internal class AnimatedBitmapOverlay(
     private val videoHeight: Int,
     private val layerStartUs: Long,
     private val layerEndUs: Long,
-    private val animations: List<LayerAnimationConfig>
+    private val animations: List<LayerAnimationConfig>,
+    private val rotation: Float = 0f,
+    private val opacity: Float = 1f,
+    private val anchorX: Float = 0.5f,
+    private val anchorY: Float = 0.5f
 ) : BitmapOverlay() {
 
     override fun getBitmap(presentationTimeUs: Long): Bitmap = bitmap
@@ -152,10 +156,11 @@ internal class AnimatedBitmapOverlay(
         val clampedScale = scaleVal.coerceAtLeast(0f)
 
         return StaticOverlaySettings.Builder()
-            .setAlphaScale(clampedAlpha)
             .setBackgroundFrameAnchor(baseNormX + offsetX, baseNormY + offsetY)
-            .setOverlayFrameAnchor(0f, 0f)
+            .setOverlayFrameAnchor(anchorX * 2f - 1f, 1f - anchorY * 2f)
             .setScale(clampedScale, clampedScale)
+            .setRotationDegrees(rotation)
+            .setAlphaScale((clampedAlpha * opacity).coerceIn(0f, 1f))
             .build()
     }
 }

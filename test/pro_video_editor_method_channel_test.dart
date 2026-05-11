@@ -11,6 +11,7 @@ import 'pro_video_editor_method_channel_test.mocks.dart';
   EditorVideo,
   ThumbnailConfigs,
   KeyFramesConfigs,
+  FrameThumbnailConfigs,
   VideoRenderData,
 ])
 void main() {
@@ -278,6 +279,63 @@ void main() {
 
       expect(capturedArgs?['lastFrameTolerance'], isFalse);
       expect(capturedArgs?['timestamps'], [0]);
+    });
+  });
+
+  group('getFrameThumbnail', () {
+    test('returns thumbnail at requested timestamp', () async {
+      final result = await platform.getFrameThumbnail(
+        FrameThumbnailConfigs(
+          video: mockVideo,
+          outputSize: const Size(100, 100),
+          timestamp: const Duration(milliseconds: 1500),
+        ),
+      );
+
+      expect(result, isA<Uint8List>());
+      expect(result, mockBytes);
+    });
+
+    test('sends timestamp in microseconds', () async {
+      Map<dynamic, dynamic>? capturedArgs;
+
+      TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+          .setMockMethodCallHandler(channel, (MethodCall methodCall) async {
+            if (methodCall.method == 'getThumbnails') {
+              capturedArgs = methodCall.arguments as Map<dynamic, dynamic>;
+              return [mockBytes];
+            }
+            return null;
+          });
+
+      await platform.getFrameThumbnail(
+        FrameThumbnailConfigs(
+          video: mockVideo,
+          outputSize: const Size(100, 100),
+          timestamp: const Duration(milliseconds: 1500),
+        ),
+      );
+
+      expect(capturedArgs?['timestamps'], [1500000]);
+      expect(capturedArgs?['lastFrameTolerance'], isNull);
+    });
+
+    test('returns null when native returns empty list', () async {
+      TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+          .setMockMethodCallHandler(channel, (MethodCall methodCall) async {
+            if (methodCall.method == 'getThumbnails') return <Uint8List>[];
+            return null;
+          });
+
+      final result = await platform.getFrameThumbnail(
+        FrameThumbnailConfigs(
+          video: mockVideo,
+          outputSize: const Size(100, 100),
+          timestamp: const Duration(seconds: 2),
+        ),
+      );
+
+      expect(result, isNull);
     });
   });
 }

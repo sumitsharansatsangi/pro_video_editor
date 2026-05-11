@@ -82,7 +82,13 @@ class CompositionBuilder(
                     y = imageLayer.y,
                     width = imageLayer.width,
                     height = imageLayer.height,
-                    animations = imageLayer.animations
+                    animations = imageLayer.animations,
+                    rotation = imageLayer.rotation,
+                    opacity = imageLayer.opacity,
+                    zIndex = imageLayer.zIndex,
+                    anchorX = imageLayer.anchorX,
+                    anchorY = imageLayer.anchorY,
+                    blendMode = imageLayer.blendMode
                 )
             })
             .setEnableAudio(config.enableAudio)

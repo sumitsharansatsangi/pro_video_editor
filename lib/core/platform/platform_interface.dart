@@ -9,6 +9,7 @@ import '/core/models/audio/waveform_configs_model.dart';
 import '/core/models/audio/waveform_data_model.dart';
 import '/core/models/platform/native_log_level.dart';
 import '/core/models/platform/video_editor_capabilities.dart';
+import '/core/models/thumbnail/frame_thumbnail_configs_model.dart';
 import '/core/models/thumbnail/key_frames_configs_model.dart';
 import '/core/models/thumbnail/single_thumbnail_configs_model.dart';
 import '/core/models/thumbnail/thumbnail_configs_model.dart';
@@ -245,6 +246,22 @@ abstract class ProVideoEditor extends PlatformInterface {
     NativeLogLevel? nativeLogLevel,
   }) {
     throw UnimplementedError('getSingleThumbnail() has not been implemented.');
+  }
+
+  /// Extracts a single frame thumbnail at a specific timestamp.
+  ///
+  /// [value] Configuration containing:
+  /// - Video source ([EditorVideo])
+  /// - Timestamp to capture
+  /// - Desired thumbnail dimensions
+  /// - Image quality settings
+  ///
+  /// Returns the thumbnail as a [Uint8List], or `null` if extraction fails.
+  Future<Uint8List?> getFrameThumbnail(
+    FrameThumbnailConfigs value, {
+    NativeLogLevel? nativeLogLevel,
+  }) {
+    throw UnimplementedError('getFrameThumbnail() has not been implemented.');
   }
 
   /// Extracts audio from a video file.

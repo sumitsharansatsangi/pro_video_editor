@@ -11,6 +11,7 @@ import 'package:pro_video_editor/core/models/audio/audio_extract_configs_model.d
 import 'package:pro_video_editor/core/models/exceptions/unsupported_feature_exception.dart';
 import 'package:pro_video_editor/core/models/platform/video_editor_capabilities.dart';
 import 'package:pro_video_editor/core/models/platform/video_editor_feature.dart';
+import 'package:pro_video_editor/core/models/thumbnail/frame_thumbnail_configs_model.dart';
 import 'package:pro_video_editor/core/models/video/progress_model.dart';
 import 'package:web/web.dart' as web;
 
@@ -69,6 +70,7 @@ class ProVideoEditorWeb extends ProVideoEditor {
         VideoEditorFeature.thumbnails,
         VideoEditorFeature.keyFrames,
         VideoEditorFeature.singleThumbnail,
+        VideoEditorFeature.frameThumbnail,
       },
     );
   }
@@ -142,6 +144,27 @@ class ProVideoEditorWeb extends ProVideoEditor {
       configs,
       onProgress: (progress) => _updateProgress(value.id, progress),
     );
+    return results.isNotEmpty ? results.first : null;
+  }
+
+  @override
+  Future<Uint8List?> getFrameThumbnail(
+    FrameThumbnailConfigs value, {
+    NativeLogLevel? nativeLogLevel,
+  }) async {
+    final results = await _manager.getThumbnails(
+      ThumbnailConfigs(
+        video: value.video,
+        outputSize: value.outputSize,
+        outputFormat: value.outputFormat,
+        boxFit: value.boxFit,
+        id: value.id,
+        jpegQuality: value.jpegQuality,
+        timestamps: [value.timestamp],
+      ),
+      onProgress: (progress) => _updateProgress(value.id, progress),
+    );
+
     return results.isNotEmpty ? results.first : null;
   }
 

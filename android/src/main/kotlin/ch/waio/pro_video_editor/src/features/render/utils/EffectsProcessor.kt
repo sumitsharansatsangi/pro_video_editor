@@ -53,7 +53,7 @@ class EffectsProcessor {
         // Scale is NOT applied here — it is applied by VideoSequenceBuilder
         // AFTER overlay and crop to match the iOS/macOS pipeline order.
         applyColorMatrix(videoEffects, config.colorFilters)
-        applyBlur(videoEffects, config.blur)
+        applyBlur(videoEffects, config.blur, config.blurFilters)
         applyPlaybackSpeed(videoEffects, audioEffects, config.playbackSpeed)
 
         return ProcessedEffects(videoEffects, audioEffects)

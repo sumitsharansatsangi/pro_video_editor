@@ -21,10 +21,16 @@ class ImageLayer with TimeRangeMixin {
     this.offset,
     this.size,
     this.animations = const [],
+    this.rotation = 0,
+    this.opacity = 1,
+    this.zIndex = 0,
+    this.anchor,
+    this.blendMode = 'sourceOver',
   }) : assert(
-          startTime == null || endTime == null || startTime < endTime,
-          'startTime must be before endTime',
-        );
+         startTime == null || endTime == null || startTime < endTime,
+         'startTime must be before endTime',
+       ),
+       assert(opacity >= 0 && opacity <= 1, 'opacity must be between 0 and 1');
 
   /// The image to overlay on the video.
   final EditorLayerImage image;
@@ -61,6 +67,27 @@ class ImageLayer with TimeRangeMixin {
   /// and optional [LayerAnimation.curve].
   final List<LayerAnimation> animations;
 
+  /// Clockwise rotation in degrees.
+  final double rotation;
+
+  /// Layer opacity from 0.0 (transparent) to 1.0 (opaque).
+  final double opacity;
+
+  /// Draw order for overlapping layers. Higher values render above lower ones.
+  final int zIndex;
+
+  /// Anchor point within the layer, normalized from 0.0 to 1.0.
+  ///
+  /// `Offset(0, 0)` is top-left, `Offset(0.5, 0.5)` is center, and
+  /// `Offset(1, 1)` is bottom-right. When null, positioned layers use center
+  /// anchoring to preserve the original behavior.
+  final Offset? anchor;
+
+  /// Blend mode intent for platforms that support it.
+  ///
+  /// Android currently renders image layers with normal source-over blending.
+  final String blendMode;
+
   ImageLayer copyWith({
     EditorLayerImage? image,
     Duration? startTime,
@@ -68,6 +95,11 @@ class ImageLayer with TimeRangeMixin {
     Offset? offset,
     Size? size,
     List<LayerAnimation>? animations,
+    double? rotation,
+    double? opacity,
+    int? zIndex,
+    Offset? anchor,
+    String? blendMode,
   }) {
     return ImageLayer(
       image: image ?? this.image,
@@ -76,6 +108,11 @@ class ImageLayer with TimeRangeMixin {
       offset: offset ?? this.offset,
       size: size ?? this.size,
       animations: animations ?? this.animations,
+      rotation: rotation ?? this.rotation,
+      opacity: opacity ?? this.opacity,
+      zIndex: zIndex ?? this.zIndex,
+      anchor: anchor ?? this.anchor,
+      blendMode: blendMode ?? this.blendMode,
     );
   }
 
@@ -85,9 +122,15 @@ class ImageLayer with TimeRangeMixin {
       'startTime': startTime?.inMicroseconds,
       'endTime': endTime?.inMicroseconds,
       'offset': offset != null ? {'dx': offset!.dx, 'dy': offset!.dy} : null,
-      'size':
-          size != null ? {'width': size!.width, 'height': size!.height} : null,
+      'size': size != null
+          ? {'width': size!.width, 'height': size!.height}
+          : null,
       'animations': animations.map((a) => a.toMap()).toList(),
+      'rotation': rotation,
+      'opacity': opacity,
+      'zIndex': zIndex,
+      'anchor': anchor != null ? {'dx': anchor!.dx, 'dy': anchor!.dy} : null,
+      'blendMode': blendMode,
     };
   }
 
@@ -112,10 +155,21 @@ class ImageLayer with TimeRangeMixin {
               safeParseDouble((map['size'] as Map<String, dynamic>)['height']),
             )
           : null,
-      animations: (map['animations'] as List<dynamic>?)
+      animations:
+          (map['animations'] as List<dynamic>?)
               ?.map((a) => LayerAnimation.fromMap(a as Map<String, dynamic>))
               .toList() ??
           const [],
+      rotation: tryParseDouble(map['rotation']) ?? 0,
+      opacity: tryParseDouble(map['opacity']) ?? 1,
+      zIndex: map['zIndex'] != null ? safeParseInt(map['zIndex']) : 0,
+      anchor: map['anchor'] != null
+          ? Offset(
+              safeParseDouble((map['anchor'] as Map<String, dynamic>)['dx']),
+              safeParseDouble((map['anchor'] as Map<String, dynamic>)['dy']),
+            )
+          : null,
+      blendMode: map['blendMode'] as String? ?? 'sourceOver',
     );
   }
 
@@ -132,7 +186,12 @@ class ImageLayer with TimeRangeMixin {
         'endTime: $endTime, '
         'offset: $offset, '
         'size: $size, '
-        'animations: $animations'
+        'animations: $animations, '
+        'rotation: $rotation, '
+        'opacity: $opacity, '
+        'zIndex: $zIndex, '
+        'anchor: $anchor, '
+        'blendMode: $blendMode'
         ')';
   }
 
@@ -145,7 +204,12 @@ class ImageLayer with TimeRangeMixin {
         other.endTime == endTime &&
         other.offset == offset &&
         other.size == size &&
-        listEquals(other.animations, animations);
+        listEquals(other.animations, animations) &&
+        other.rotation == rotation &&
+        other.opacity == opacity &&
+        other.zIndex == zIndex &&
+        other.anchor == anchor &&
+        other.blendMode == blendMode;
   }
 
   @override
@@ -155,6 +219,11 @@ class ImageLayer with TimeRangeMixin {
         endTime.hashCode ^
         offset.hashCode ^
         size.hashCode ^
-        animations.hashCode;
+        animations.hashCode ^
+        rotation.hashCode ^
+        opacity.hashCode ^
+        zIndex.hashCode ^
+        anchor.hashCode ^
+        blendMode.hashCode;
   }
 }

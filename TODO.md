@@ -19,6 +19,14 @@ core editor capabilities, then advanced editing polish.
 
 ## P1 - Core Editing Features
 
+- Android status:
+  - [x] Add Android image-layer rotation, opacity, z-index, and anchor support.
+  - [x] Add Android timed blur filters.
+  - [x] Preserve Android timed color filters.
+  - [ ] Add Android pixelate/censor effect support.
+  - [ ] Add Android first-class text, shape, and sticker layer rasterization.
+  - [ ] Add Android per-clip visual transforms and transitions.
+
 - [ ] Add first-class text layers.
 - [ ] Add shape layers: rectangle, circle, line, arrow, and highlight box.
 - [ ] Add structured sticker/emoji layers.
@@ -27,12 +35,12 @@ core editor capabilities, then advanced editing polish.
 - [ ] Add per-time-range blur, pixelate, and color filters.
 - [ ] Add per-clip crop, rotate, flip, scale, color filter, volume, and speed.
 - [ ] Add transitions between merged segments: fade, dissolve, slide, and wipe.
-- [ ] Add frame extraction at a specific timestamp.
+- [x] Add frame extraction at a specific timestamp.
 
 ## P2 - Timeline And Composition
 
-- [ ] Add split/cut/delete-range helpers for timeline editing.
-- [ ] Add clip reorder helpers.
+- [x] Add split/cut/delete-range helpers for timeline editing.
+- [x] Add clip reorder helpers.
 - [ ] Add still-image segments with duration.
 - [ ] Add picture-in-picture video overlay support.
 - [ ] Add background canvas controls for aspect-ratio changes.

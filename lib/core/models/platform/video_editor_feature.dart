@@ -15,6 +15,9 @@ enum VideoEditorFeature {
   /// Generate one thumbnail at the first or last frame.
   singleThumbnail,
 
+  /// Extract a frame thumbnail at a specific timestamp.
+  frameThumbnail,
+
   /// Render a video and return the bytes in memory.
   renderVideo,
 

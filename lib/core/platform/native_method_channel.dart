@@ -14,6 +14,7 @@ import '/core/models/audio/waveform_chunk_model.dart';
 import '/core/models/audio/waveform_configs_model.dart';
 import '/core/models/audio/waveform_data_model.dart';
 import '/core/models/exceptions/render_exceptions.dart';
+import '/core/models/thumbnail/frame_thumbnail_configs_model.dart';
 import '/core/models/thumbnail/key_frames_configs_model.dart';
 import '/core/models/thumbnail/single_thumbnail_configs_model.dart';
 import '/core/models/thumbnail/thumbnail_base_abstract.dart';
@@ -95,6 +96,7 @@ class MethodChannelProVideoEditor extends ProVideoEditor {
           VideoEditorFeature.thumbnails,
           VideoEditorFeature.keyFrames,
           VideoEditorFeature.singleThumbnail,
+          VideoEditorFeature.frameThumbnail,
           VideoEditorFeature.renderVideo,
           VideoEditorFeature.renderVideoToFile,
           VideoEditorFeature.cancel,
@@ -257,6 +259,21 @@ class MethodChannelProVideoEditor extends ProVideoEditor {
     );
     final List<Uint8List> result = response?.cast<Uint8List>() ?? [];
     return result.isNotEmpty ? result.first : null;
+  }
+
+  @override
+  Future<Uint8List?> getFrameThumbnail(
+    FrameThumbnailConfigs value, {
+    NativeLogLevel? nativeLogLevel,
+  }) async {
+    await _ensureFeatureSupported(VideoEditorFeature.frameThumbnail);
+
+    final thumbnails = await _extractThumbnails(
+      value,
+      nativeLogLevel: nativeLogLevel,
+    );
+
+    return thumbnails.isNotEmpty ? thumbnails.first : null;
   }
 
   @override

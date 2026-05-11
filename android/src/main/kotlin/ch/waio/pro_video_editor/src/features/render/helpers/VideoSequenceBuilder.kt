@@ -65,7 +65,13 @@ class VideoSequenceBuilder(
         val y: Int? = null,
         val width: Double? = null,
         val height: Double? = null,
-        val animations: List<LayerAnimationConfig> = emptyList()
+        val animations: List<LayerAnimationConfig> = emptyList(),
+        val rotation: Float = 0f,
+        val opacity: Float = 1f,
+        val zIndex: Int = 0,
+        val anchorX: Float? = null,
+        val anchorY: Float? = null,
+        val blendMode: String = "sourceOver"
     )
 
     /**
