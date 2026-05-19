@@ -2,6 +2,7 @@ package ch.waio.pro_video_editor.src.features.render
 
 import androidx.media3.common.Effect
 import androidx.media3.common.audio.AudioProcessor
+import applyAdjustment
 import applyBlur
 import applyColorMatrix
 import applyFlip
@@ -54,6 +55,7 @@ class EffectsProcessor {
         // AFTER overlay and crop to match the iOS/macOS pipeline order.
         applyColorMatrix(videoEffects, config.colorFilters)
         applyBlur(videoEffects, config.blur, config.blurFilters)
+        applyAdjustment(videoEffects, config.adjustment)
         applyPlaybackSpeed(videoEffects, audioEffects, config.playbackSpeed)
 
         return ProcessedEffects(videoEffects, audioEffects)

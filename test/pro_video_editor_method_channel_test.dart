@@ -67,7 +67,8 @@ void main() {
     final capabilities = await platform.getSupportedFeatures();
 
     expect(capabilities.platform, isNotEmpty);
-    expect(capabilities.supports(VideoEditorFeature.pixelateLayers), isFalse);
+    expect(capabilities.supports(VideoEditorFeature.metadata), isTrue);
+    expect(capabilities.supports(VideoEditorFeature.editorUi), isFalse);
   });
 
   test('getMetadata returns correct metadata', () async {

@@ -46,6 +46,25 @@ class VideoRenderData {
     this.shouldOptimizeForNetworkUse = false,
     this.imageBytesWithCropping = false,
     @Deprecated('Use audioTracks instead.') this.loopCustomAudio = true,
+    this.pixelateFilters = const [],
+    this.fps,
+    this.codec,
+    this.encoderPreference = EncoderPreference.auto,
+    this.adjustment,
+    this.vignetteFilter,
+    this.textLayers = const [],
+    this.shapeLayers = const [],
+    this.stickerLayers = const [],
+    this.videoOverlayLayers = const [],
+    this.backgroundCanvas,
+    this.resolutionPreset = VideoResolutionPreset.original,
+    this.audioCrossfade,
+    this.originalAudioTrackIndex,
+    this.replaceOriginalAudioPath,
+    this.loudnessNormalization,
+    this.audioDucking,
+    this.audioPan,
+    this.voiceOverRecordingConfig,
   }) : id = id ?? DateTime.now().microsecondsSinceEpoch.toString(),
        assert(
          (video != null) != (videoSegments != null),
@@ -403,6 +422,81 @@ class VideoRenderData {
   @Deprecated('Use audioTracks instead.')
   final bool loopCustomAudio;
 
+  /// Pixelate/censor regions with optional time ranges.
+  ///
+  /// **Platform support:** Requires [VideoEditorFeature.pixelateLayers].
+  final List<PixelateFilter> pixelateFilters;
+
+  /// Output frame rate in frames per second.
+  ///
+  /// When null, the source frame rate is preserved.
+  ///
+  /// **Platform support:** Requires [VideoEditorFeature.fpsControl].
+  final int? fps;
+
+  /// Preferred output video codec.
+  ///
+  /// When null, the platform chooses a default (typically H.264).
+  ///
+  /// **Platform support:** Requires [VideoEditorFeature.codecSelection].
+  final VideoCodec? codec;
+
+  /// Preferred encoder type (hardware, software, or auto).
+  ///
+  /// **Default:** [EncoderPreference.auto]
+  ///
+  /// **Platform support:** Requires [VideoEditorFeature.encoderPreference].
+  final EncoderPreference encoderPreference;
+
+  /// Colour-grading adjustments (brightness, contrast, saturation, etc.).
+  ///
+  /// **Platform support:** Requires [VideoEditorFeature.adjustment].
+  final VideoAdjustment? adjustment;
+
+  /// Vignette effect applied to the output.
+  ///
+  /// **Platform support:** Requires [VideoEditorFeature.vignette].
+  final VignetteFilter? vignetteFilter;
+
+  /// First-class text layers for native rasterization.
+  final List<TextLayer> textLayers;
+
+  /// Vector shape layers such as rectangles, circles, lines, and arrows.
+  final List<ShapeLayer> shapeLayers;
+
+  /// Structured sticker and emoji layers.
+  final List<StickerLayer> stickerLayers;
+
+  /// Picture-in-picture video overlays.
+  final List<VideoOverlayLayer> videoOverlayLayers;
+
+  /// Background canvas controls for aspect-ratio changes.
+  final BackgroundCanvas? backgroundCanvas;
+
+  /// Output resolution preset independent from bitrate.
+  final VideoResolutionPreset resolutionPreset;
+
+  /// Audio crossfade between adjacent segments.
+  final AudioCrossfade? audioCrossfade;
+
+  /// Original audio track index to use when the input has multiple tracks.
+  final int? originalAudioTrackIndex;
+
+  /// Optional replacement audio path for the original source audio.
+  final String? replaceOriginalAudioPath;
+
+  /// Loudness normalization settings.
+  final LoudnessNormalization? loudnessNormalization;
+
+  /// Background music ducking settings.
+  final AudioDucking? audioDucking;
+
+  /// Pan/balance controls for the original output mix.
+  final AudioPan? audioPan;
+
+  /// Voice-over recording helper configuration.
+  final VoiceOverRecordingConfig? voiceOverRecordingConfig;
+
   /// Returns a [Stream] of [ProgressModel] objects that provides updates on
   /// the progress of the video rendering process associated with this model's
   /// [id].
@@ -579,6 +673,28 @@ class VideoRenderData {
       'endUs': videoSegments != null ? endTime?.inMicroseconds : null,
       'shouldOptimizeForNetworkUse': shouldOptimizeForNetworkUse,
       'imageBytesWithCropping': imageBytesWithCropping,
+      'pixelateFilters': pixelateFilters.map((f) => f.toMap()).toList(),
+      'fps': fps,
+      'codec': codec?.name,
+      'encoderPreference': encoderPreference.name,
+      if (adjustment != null && !adjustment!.isEmpty)
+        'adjustment': adjustment!.toMap(),
+      'vignetteFilter': vignetteFilter?.toMap(),
+      'textLayers': textLayers.map((layer) => layer.toMap()).toList(),
+      'shapeLayers': shapeLayers.map((layer) => layer.toMap()).toList(),
+      'stickerLayers': stickerLayers.map((layer) => layer.toMap()).toList(),
+      'videoOverlayLayers': await Future.wait(
+        videoOverlayLayers.map((layer) => layer.toAsyncMap()),
+      ),
+      'backgroundCanvas': backgroundCanvas?.toMap(),
+      'resolutionPreset': resolutionPreset.name,
+      'audioCrossfade': audioCrossfade?.toMap(),
+      'originalAudioTrackIndex': originalAudioTrackIndex,
+      'replaceOriginalAudioPath': replaceOriginalAudioPath,
+      'loudnessNormalization': loudnessNormalization?.toMap(),
+      'audioDucking': audioDucking?.toMap(),
+      'audioPan': audioPan?.toMap(),
+      'voiceOverRecordingConfig': voiceOverRecordingConfig?.toMap(),
     };
   }
 
@@ -609,6 +725,25 @@ class VideoRenderData {
     bool? shouldOptimizeForNetworkUse,
     bool? imageBytesWithCropping,
     bool? loopCustomAudio,
+    List<PixelateFilter>? pixelateFilters,
+    int? fps,
+    VideoCodec? codec,
+    EncoderPreference? encoderPreference,
+    VideoAdjustment? adjustment,
+    VignetteFilter? vignetteFilter,
+    List<TextLayer>? textLayers,
+    List<ShapeLayer>? shapeLayers,
+    List<StickerLayer>? stickerLayers,
+    List<VideoOverlayLayer>? videoOverlayLayers,
+    BackgroundCanvas? backgroundCanvas,
+    VideoResolutionPreset? resolutionPreset,
+    AudioCrossfade? audioCrossfade,
+    int? originalAudioTrackIndex,
+    String? replaceOriginalAudioPath,
+    LoudnessNormalization? loudnessNormalization,
+    AudioDucking? audioDucking,
+    AudioPan? audioPan,
+    VoiceOverRecordingConfig? voiceOverRecordingConfig,
   }) {
     return VideoRenderData(
       id: id ?? this.id,
@@ -638,6 +773,29 @@ class VideoRenderData {
       imageBytesWithCropping:
           imageBytesWithCropping ?? this.imageBytesWithCropping,
       loopCustomAudio: loopCustomAudio ?? this.loopCustomAudio,
+      pixelateFilters: pixelateFilters ?? this.pixelateFilters,
+      fps: fps ?? this.fps,
+      codec: codec ?? this.codec,
+      encoderPreference: encoderPreference ?? this.encoderPreference,
+      adjustment: adjustment ?? this.adjustment,
+      vignetteFilter: vignetteFilter ?? this.vignetteFilter,
+      textLayers: textLayers ?? this.textLayers,
+      shapeLayers: shapeLayers ?? this.shapeLayers,
+      stickerLayers: stickerLayers ?? this.stickerLayers,
+      videoOverlayLayers: videoOverlayLayers ?? this.videoOverlayLayers,
+      backgroundCanvas: backgroundCanvas ?? this.backgroundCanvas,
+      resolutionPreset: resolutionPreset ?? this.resolutionPreset,
+      audioCrossfade: audioCrossfade ?? this.audioCrossfade,
+      originalAudioTrackIndex:
+          originalAudioTrackIndex ?? this.originalAudioTrackIndex,
+      replaceOriginalAudioPath:
+          replaceOriginalAudioPath ?? this.replaceOriginalAudioPath,
+      loudnessNormalization:
+          loudnessNormalization ?? this.loudnessNormalization,
+      audioDucking: audioDucking ?? this.audioDucking,
+      audioPan: audioPan ?? this.audioPan,
+      voiceOverRecordingConfig:
+          voiceOverRecordingConfig ?? this.voiceOverRecordingConfig,
     );
   }
 
@@ -668,6 +826,25 @@ class VideoRenderData {
       'shouldOptimizeForNetworkUse': shouldOptimizeForNetworkUse,
       'imageBytesWithCropping': imageBytesWithCropping,
       'loopCustomAudio': loopCustomAudio,
+      'pixelateFilters': pixelateFilters.map((x) => x.toMap()).toList(),
+      'fps': fps,
+      'codec': codec?.name,
+      'encoderPreference': encoderPreference.name,
+      'adjustment': adjustment?.toMap(),
+      'vignetteFilter': vignetteFilter?.toMap(),
+      'textLayers': textLayers.map((x) => x.toMap()).toList(),
+      'shapeLayers': shapeLayers.map((x) => x.toMap()).toList(),
+      'stickerLayers': stickerLayers.map((x) => x.toMap()).toList(),
+      'videoOverlayLayers': videoOverlayLayers.map((x) => x.toMap()).toList(),
+      'backgroundCanvas': backgroundCanvas?.toMap(),
+      'resolutionPreset': resolutionPreset.name,
+      'audioCrossfade': audioCrossfade?.toMap(),
+      'originalAudioTrackIndex': originalAudioTrackIndex,
+      'replaceOriginalAudioPath': replaceOriginalAudioPath,
+      'loudnessNormalization': loudnessNormalization?.toMap(),
+      'audioDucking': audioDucking?.toMap(),
+      'audioPan': audioPan?.toMap(),
+      'voiceOverRecordingConfig': voiceOverRecordingConfig?.toMap(),
     };
   }
 
@@ -746,6 +923,80 @@ class VideoRenderData {
       shouldOptimizeForNetworkUse: map['shouldOptimizeForNetworkUse'] as bool,
       imageBytesWithCropping: map['imageBytesWithCropping'] as bool,
       loopCustomAudio: map['loopCustomAudio'] as bool,
+      pixelateFilters: List<PixelateFilter>.from(
+        ((map['pixelateFilters'] as List?) ?? const []).map<PixelateFilter>(
+          (x) => PixelateFilter.fromMap(x as Map<String, dynamic>),
+        ),
+      ),
+      fps: map['fps'] != null ? safeParseInt(map['fps']) : null,
+      codec: map['codec'] != null
+          ? VideoCodec.values.byName(map['codec'] as String)
+          : null,
+      encoderPreference: map['encoderPreference'] != null
+          ? EncoderPreference.values.byName(map['encoderPreference'] as String)
+          : EncoderPreference.auto,
+      adjustment: map['adjustment'] != null
+          ? VideoAdjustment.fromMap(map['adjustment'] as Map<String, dynamic>)
+          : null,
+      vignetteFilter: map['vignetteFilter'] != null
+          ? VignetteFilter.fromMap(
+              map['vignetteFilter'] as Map<String, dynamic>,
+            )
+          : null,
+      textLayers: List<TextLayer>.from(
+        ((map['textLayers'] as List?) ?? const []).map<TextLayer>(
+          (x) => TextLayer.fromMap(x as Map<String, dynamic>),
+        ),
+      ),
+      shapeLayers: List<ShapeLayer>.from(
+        ((map['shapeLayers'] as List?) ?? const []).map<ShapeLayer>(
+          (x) => ShapeLayer.fromMap(x as Map<String, dynamic>),
+        ),
+      ),
+      stickerLayers: List<StickerLayer>.from(
+        ((map['stickerLayers'] as List?) ?? const []).map<StickerLayer>(
+          (x) => StickerLayer.fromMap(x as Map<String, dynamic>),
+        ),
+      ),
+      videoOverlayLayers: List<VideoOverlayLayer>.from(
+        ((map['videoOverlayLayers'] as List?) ?? const [])
+            .map<VideoOverlayLayer>(
+              (x) => VideoOverlayLayer.fromMap(x as Map<String, dynamic>),
+            ),
+      ),
+      backgroundCanvas: map['backgroundCanvas'] != null
+          ? BackgroundCanvas.fromMap(
+              map['backgroundCanvas'] as Map<String, dynamic>,
+            )
+          : null,
+      resolutionPreset: VideoResolutionPreset.values.byName(
+        map['resolutionPreset'] as String? ?? 'original',
+      ),
+      audioCrossfade: map['audioCrossfade'] != null
+          ? AudioCrossfade.fromMap(
+              map['audioCrossfade'] as Map<String, dynamic>,
+            )
+          : null,
+      originalAudioTrackIndex: map['originalAudioTrackIndex'] != null
+          ? safeParseInt(map['originalAudioTrackIndex'])
+          : null,
+      replaceOriginalAudioPath: map['replaceOriginalAudioPath'] as String?,
+      loudnessNormalization: map['loudnessNormalization'] != null
+          ? LoudnessNormalization.fromMap(
+              map['loudnessNormalization'] as Map<String, dynamic>,
+            )
+          : null,
+      audioDucking: map['audioDucking'] != null
+          ? AudioDucking.fromMap(map['audioDucking'] as Map<String, dynamic>)
+          : null,
+      audioPan: map['audioPan'] != null
+          ? AudioPan.fromMap(map['audioPan'] as Map<String, dynamic>)
+          : null,
+      voiceOverRecordingConfig: map['voiceOverRecordingConfig'] != null
+          ? VoiceOverRecordingConfig.fromMap(
+              map['voiceOverRecordingConfig'] as Map<String, dynamic>,
+            )
+          : null,
     );
   }
 
@@ -779,7 +1030,25 @@ class VideoRenderData {
         'customAudioVolume: $customAudioVolume, '
         'shouldOptimizeForNetworkUse: $shouldOptimizeForNetworkUse, '
         'imageBytesWithCropping: $imageBytesWithCropping, '
-        'loopCustomAudio: $loopCustomAudio)';
+        'loopCustomAudio: $loopCustomAudio, '
+        'pixelateFilters: $pixelateFilters, '
+        'fps: $fps, codec: $codec, '
+        'encoderPreference: $encoderPreference, '
+        'adjustment: $adjustment, '
+        'vignetteFilter: $vignetteFilter, '
+        'textLayers: $textLayers, '
+        'shapeLayers: $shapeLayers, '
+        'stickerLayers: $stickerLayers, '
+        'videoOverlayLayers: $videoOverlayLayers, '
+        'backgroundCanvas: $backgroundCanvas, '
+        'resolutionPreset: $resolutionPreset, '
+        'audioCrossfade: $audioCrossfade, '
+        'originalAudioTrackIndex: $originalAudioTrackIndex, '
+        'replaceOriginalAudioPath: $replaceOriginalAudioPath, '
+        'loudnessNormalization: $loudnessNormalization, '
+        'audioDucking: $audioDucking, '
+        'audioPan: $audioPan, '
+        'voiceOverRecordingConfig: $voiceOverRecordingConfig)';
   }
 
   @override
@@ -810,7 +1079,26 @@ class VideoRenderData {
         other.customAudioVolume == customAudioVolume &&
         other.shouldOptimizeForNetworkUse == shouldOptimizeForNetworkUse &&
         other.imageBytesWithCropping == imageBytesWithCropping &&
-        other.loopCustomAudio == loopCustomAudio;
+        other.loopCustomAudio == loopCustomAudio &&
+        listEquals(other.pixelateFilters, pixelateFilters) &&
+        other.fps == fps &&
+        other.codec == codec &&
+        other.encoderPreference == encoderPreference &&
+        other.adjustment == adjustment &&
+        other.vignetteFilter == vignetteFilter &&
+        listEquals(other.textLayers, textLayers) &&
+        listEquals(other.shapeLayers, shapeLayers) &&
+        listEquals(other.stickerLayers, stickerLayers) &&
+        listEquals(other.videoOverlayLayers, videoOverlayLayers) &&
+        other.backgroundCanvas == backgroundCanvas &&
+        other.resolutionPreset == resolutionPreset &&
+        other.audioCrossfade == audioCrossfade &&
+        other.originalAudioTrackIndex == originalAudioTrackIndex &&
+        other.replaceOriginalAudioPath == replaceOriginalAudioPath &&
+        other.loudnessNormalization == loudnessNormalization &&
+        other.audioDucking == audioDucking &&
+        other.audioPan == audioPan &&
+        other.voiceOverRecordingConfig == voiceOverRecordingConfig;
   }
 
   @override
@@ -839,7 +1127,26 @@ class VideoRenderData {
         customAudioVolume.hashCode ^
         shouldOptimizeForNetworkUse.hashCode ^
         imageBytesWithCropping.hashCode ^
-        loopCustomAudio.hashCode;
+        loopCustomAudio.hashCode ^
+        pixelateFilters.hashCode ^
+        fps.hashCode ^
+        codec.hashCode ^
+        encoderPreference.hashCode ^
+        adjustment.hashCode ^
+        vignetteFilter.hashCode ^
+        textLayers.hashCode ^
+        shapeLayers.hashCode ^
+        stickerLayers.hashCode ^
+        videoOverlayLayers.hashCode ^
+        backgroundCanvas.hashCode ^
+        resolutionPreset.hashCode ^
+        audioCrossfade.hashCode ^
+        originalAudioTrackIndex.hashCode ^
+        replaceOriginalAudioPath.hashCode ^
+        loudnessNormalization.hashCode ^
+        audioDucking.hashCode ^
+        audioPan.hashCode ^
+        voiceOverRecordingConfig.hashCode;
   }
 }
 
@@ -848,8 +1155,19 @@ enum VideoOutputFormat {
   /// MPEG-4 Part 14, widely supported.
   mp4,
 
-  /// mov format.
-  ///
-  /// Only supported on macos and ios.
+  /// QuickTime Movie — macOS and iOS only.
   mov,
+
+  /// WebM — open format; good for web. Requires platform support.
+  webm,
+
+  /// Animated GIF — low quality, small size, no audio.
+  /// Requires platform support.
+  gif,
+
+  /// MP3 audio-only export. Requires platform support.
+  mp3,
+
+  /// WAV audio-only export (uncompressed). Requires platform support.
+  wav,
 }

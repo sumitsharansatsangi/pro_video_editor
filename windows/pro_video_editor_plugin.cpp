@@ -80,7 +80,7 @@ namespace pro_video_editor {
 
 			pro_video_editor::HandleGetMetadata(*args, std::move(result));
 		}
-		else if (method_call.method_name().compare("createVideoThumbnails") == 0) {
+		else if (method_call.method_name().compare("getThumbnails") == 0) {
 			result->NotImplemented();
 		/* 	const auto* args = std::get_if<flutter::EncodableMap>(method_call.arguments());
 			if (!args) {

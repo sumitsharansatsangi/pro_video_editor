@@ -31,40 +31,25 @@ std::string GenerateTempFilename(const std::string& prefix, const std::string& e
     return filename.str();
 }
 
-bool WriteBytesToFile(const std::string& path, const std::vector<uint8_t>& bytes) {
-    std::ofstream out(path, std::ios::binary);
-    if (!out.is_open()) return false;
-    out.write(reinterpret_cast<const char*>(bytes.data()), bytes.size());
-    return true;
-}
-
 void HandleGenerateThumbnails(
     const flutter::EncodableMap& args,
     std::unique_ptr<flutter::MethodResult<flutter::EncodableValue>> result) {
 
-    const auto* videoBytes = std::get_if<std::vector<uint8_t>>(&args.at(flutter::EncodableValue("videoBytes")));
+    const auto* inputPath = std::get_if<std::string>(&args.at(flutter::EncodableValue("inputPath")));
     const auto* timestampsList = std::get_if<flutter::EncodableList>(&args.at(flutter::EncodableValue("timestamps")));
-    const auto* formatStr = std::get_if<std::string>(&args.at(flutter::EncodableValue("thumbnailFormat")));
-    const auto* extensionStr = std::get_if<std::string>(&args.at(flutter::EncodableValue("extension")));
-    const auto* width = std::get_if<double>(&args.at(flutter::EncodableValue("imageWidth")));
+    const auto* formatStr = std::get_if<std::string>(&args.at(flutter::EncodableValue("outputFormat")));
+    const auto* widthInt = std::get_if<int>(&args.at(flutter::EncodableValue("outputWidth")));
+    const auto* widthLong = std::get_if<int64_t>(&args.at(flutter::EncodableValue("outputWidth")));
 
-    if (!videoBytes || !timestampsList || !formatStr || !extensionStr || !width) {
+    if (!inputPath || !timestampsList || !formatStr || (!widthInt && !widthLong)) {
         result->Error("InvalidArgument", "Missing required parameters");
         return;
     }
 
-    int roundedWidth = static_cast<int>(std::round(*width));
-    std::string videoExt = *extensionStr;
-    if (videoExt.empty() || videoExt[0] != '.') videoExt = "." + videoExt;
+    int roundedWidth = widthInt ? *widthInt : static_cast<int>(*widthLong);
 
     std::string imageExt = *formatStr;
     if (imageExt.empty() || imageExt[0] != '.') imageExt = "." + imageExt;
-
-    std::string tempVideoPath = GenerateTempFilename("video_temp", videoExt);
-    if (!WriteBytesToFile(tempVideoPath, *videoBytes)) {
-        result->Error("FileError", "Failed to write temp video file");
-        return;
-    }
 
     // Assume `ffmpeg` is in system PATH on Linux
     std::string ffmpegPath = "ffmpeg";
@@ -80,8 +65,10 @@ void HandleGenerateThumbnails(
         }
 
         int currentIndex = index++;
-        int64_t tsMs = static_cast<int64_t>(std::get<int>(tsValue));
-        double tsSec = tsMs / 1000.0;
+        int64_t tsUs = std::holds_alternative<int>(tsValue)
+            ? static_cast<int64_t>(std::get<int>(tsValue))
+            : std::get<int64_t>(tsValue);
+        double tsSec = tsUs / 1000000.0;
 
         futures.push_back(std::async(std::launch::async, [=, &thumbnails]() {
             std::ostringstream timestampStream;
@@ -92,7 +79,7 @@ void HandleGenerateThumbnails(
             std::ostringstream cmd;
             cmd << ffmpegPath
                 << " -ss " << timestampStream.str()
-                << " -i \"" << tempVideoPath << "\""
+                << " -i \"" << *inputPath << "\""
                 << " -vframes 1 -vf scale=" << roundedWidth << ":-2"
                 << " \"" << tempImagePath << "\"";
 
@@ -111,7 +98,6 @@ void HandleGenerateThumbnails(
         fut.get();
     }
 
-    std::remove(tempVideoPath.c_str());
     result->Success(thumbnails);
 }
 

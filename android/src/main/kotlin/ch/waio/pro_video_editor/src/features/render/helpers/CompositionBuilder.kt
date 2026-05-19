@@ -56,11 +56,21 @@ class CompositionBuilder(
 
         Log.d(RENDER_TAG, "Creating composition with ${config.videoClips.size} video clips")
         Log.d(RENDER_TAG, "Audio enabled: ${config.enableAudio}")
-        Log.d(RENDER_TAG, "Audio tracks: ${config.audioTracks.size}")
+        val replacementAudio = config.replaceOriginalAudioPath?.let { path ->
+            AudioTrackConfig(path = path)
+        }
+        val audioTracks = if (replacementAudio != null) {
+            config.audioTracks + replacementAudio
+        } else {
+            config.audioTracks
+        }
+
+        Log.d(RENDER_TAG, "Audio tracks: ${audioTracks.size}")
 
         val rotationDegrees = (4 - (config.rotateTurns ?: 0)) * 90f
 
-        val hasCustomAudio = config.audioTracks.isNotEmpty()
+        val hasCustomAudio = audioTracks.isNotEmpty()
+        val visualLayerConfigs = buildVisualLayerConfigs()
 
         // Build video sequence
         val videoBuilder = VideoSequenceBuilder(config.videoClips)
@@ -70,27 +80,31 @@ class CompositionBuilder(
             .setFlip(config.flipX, config.flipY)
             .setScale(config.scaleX, config.scaleY)
             .setCrop(config.cropWidth, config.cropHeight, config.cropX, config.cropY)
-            .setTimedImageLayers(config.imageLayers.map { imageLayer ->
-                VideoSequenceBuilder.ImageLayerConfig(
-                    imageBytes = imageLayer.imageData,
-                    scaleX = config.scaleX,
-                    scaleY = config.scaleY,
-                    withCropping = config.imageBytesWithCropping,
-                    startUs = imageLayer.startUs,
-                    endUs = imageLayer.endUs,
-                    x = imageLayer.x,
-                    y = imageLayer.y,
-                    width = imageLayer.width,
-                    height = imageLayer.height,
-                    animations = imageLayer.animations,
-                    rotation = imageLayer.rotation,
-                    opacity = imageLayer.opacity,
-                    zIndex = imageLayer.zIndex,
-                    anchorX = imageLayer.anchorX,
-                    anchorY = imageLayer.anchorY,
-                    blendMode = imageLayer.blendMode
-                )
-            })
+            .setTimedImageLayers(
+                (
+                    config.imageLayers.map { imageLayer ->
+                        VideoSequenceBuilder.ImageLayerConfig(
+                            imageBytes = imageLayer.imageData,
+                            scaleX = config.scaleX,
+                            scaleY = config.scaleY,
+                            withCropping = config.imageBytesWithCropping,
+                            startUs = imageLayer.startUs,
+                            endUs = imageLayer.endUs,
+                            x = imageLayer.x,
+                            y = imageLayer.y,
+                            width = imageLayer.width,
+                            height = imageLayer.height,
+                            animations = imageLayer.animations,
+                            rotation = imageLayer.rotation,
+                            opacity = imageLayer.opacity,
+                            zIndex = imageLayer.zIndex,
+                            anchorX = imageLayer.anchorX,
+                            anchorY = imageLayer.anchorY,
+                            blendMode = imageLayer.blendMode
+                        )
+                    } + visualLayerConfigs
+                ).sortedBy { it.zIndex }
+            )
             .setEnableAudio(config.enableAudio)
             .setGlobalTrim(config.startUs, config.endUs)
             .setHasCustomAudio(hasCustomAudio)
@@ -100,7 +114,7 @@ class CompositionBuilder(
         videoBuilder.setAudioNormalization(needsNormalization)
 
         // Video keeps its audio - Media3 will mix it natively with custom audio sequence
-        videoBuilder.setForceRemoveAudio(false)
+        videoBuilder.setForceRemoveAudio(config.replaceOriginalAudioPath != null)
 
         // Build video sequence (with audio intact)
         val videoSequence = videoBuilder.build()
@@ -117,7 +131,7 @@ class CompositionBuilder(
         if (hasCustomAudio) {
             val totalVideoDuration = videoBuilder.calculateTotalDuration()
 
-            for ((index, track) in config.audioTracks.withIndex()) {
+            for ((index, track) in audioTracks.withIndex()) {
                 Log.d(
                     RENDER_TAG,
                     "🎵 Adding audio track $index: path=${track.path}, volume=${track.volume}, loop=${track.loop}"
@@ -145,5 +159,25 @@ class CompositionBuilder(
         Log.d(RENDER_TAG, "Composition created successfully with ${sequences.size} sequences")
 
         return composition
+    }
+
+    private fun buildVisualLayerConfigs(): List<VideoSequenceBuilder.ImageLayerConfig> {
+        val layers = mutableListOf<VideoSequenceBuilder.ImageLayerConfig>()
+
+        config.textLayers.mapNotNullTo(layers) { layer ->
+            VisualLayerRasterizer.rasterizeText(layer)
+        }
+        config.shapeLayers.mapNotNullTo(layers) { layer ->
+            VisualLayerRasterizer.rasterizeShape(layer)
+        }
+        config.stickerLayers.mapNotNullTo(layers) { layer ->
+            VisualLayerRasterizer.rasterizeSticker(layer)
+        }
+
+        if (layers.isNotEmpty()) {
+            Log.d(RENDER_TAG, "Rasterized ${layers.size} text/shape/sticker layer(s)")
+        }
+
+        return layers
     }
 }

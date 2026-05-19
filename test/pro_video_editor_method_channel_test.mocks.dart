@@ -485,6 +485,22 @@ class MockVideoRenderData extends _i1.Mock implements _i4.VideoRenderData {
           as bool);
 
   @override
+  List<_i4.PixelateFilter> get pixelateFilters =>
+      (super.noSuchMethod(
+            Invocation.getter(#pixelateFilters),
+            returnValue: <_i4.PixelateFilter>[],
+          )
+          as List<_i4.PixelateFilter>);
+
+  @override
+  _i4.EncoderPreference get encoderPreference =>
+      (super.noSuchMethod(
+            Invocation.getter(#encoderPreference),
+            returnValue: _i4.EncoderPreference.auto,
+          )
+          as _i4.EncoderPreference);
+
+  @override
   _i7.Stream<_i11.ProgressModel> get progressStream =>
       (super.noSuchMethod(
             Invocation.getter(#progressStream),
@@ -529,6 +545,25 @@ class MockVideoRenderData extends _i1.Mock implements _i4.VideoRenderData {
     bool? shouldOptimizeForNetworkUse,
     bool? imageBytesWithCropping,
     bool? loopCustomAudio,
+    List<_i4.PixelateFilter>? pixelateFilters,
+    int? fps,
+    _i4.VideoCodec? codec,
+    _i4.EncoderPreference? encoderPreference,
+    _i4.VideoAdjustment? adjustment,
+    _i4.VignetteFilter? vignetteFilter,
+    List<_i4.TextLayer>? textLayers,
+    List<_i4.ShapeLayer>? shapeLayers,
+    List<_i4.StickerLayer>? stickerLayers,
+    List<_i4.VideoOverlayLayer>? videoOverlayLayers,
+    _i4.BackgroundCanvas? backgroundCanvas,
+    _i4.VideoResolutionPreset? resolutionPreset,
+    _i4.AudioCrossfade? audioCrossfade,
+    int? originalAudioTrackIndex,
+    String? replaceOriginalAudioPath,
+    _i4.LoudnessNormalization? loudnessNormalization,
+    _i4.AudioDucking? audioDucking,
+    _i4.AudioPan? audioPan,
+    _i4.VoiceOverRecordingConfig? voiceOverRecordingConfig,
   }) =>
       (super.noSuchMethod(
             Invocation.method(#copyWith, [], {
@@ -557,6 +592,25 @@ class MockVideoRenderData extends _i1.Mock implements _i4.VideoRenderData {
               #shouldOptimizeForNetworkUse: shouldOptimizeForNetworkUse,
               #imageBytesWithCropping: imageBytesWithCropping,
               #loopCustomAudio: loopCustomAudio,
+              #pixelateFilters: pixelateFilters,
+              #fps: fps,
+              #codec: codec,
+              #encoderPreference: encoderPreference,
+              #adjustment: adjustment,
+              #vignetteFilter: vignetteFilter,
+              #textLayers: textLayers,
+              #shapeLayers: shapeLayers,
+              #stickerLayers: stickerLayers,
+              #videoOverlayLayers: videoOverlayLayers,
+              #backgroundCanvas: backgroundCanvas,
+              #resolutionPreset: resolutionPreset,
+              #audioCrossfade: audioCrossfade,
+              #originalAudioTrackIndex: originalAudioTrackIndex,
+              #replaceOriginalAudioPath: replaceOriginalAudioPath,
+              #loudnessNormalization: loudnessNormalization,
+              #audioDucking: audioDucking,
+              #audioPan: audioPan,
+              #voiceOverRecordingConfig: voiceOverRecordingConfig,
             }),
             returnValue: _FakeVideoRenderData_3(
               this,
@@ -586,6 +640,25 @@ class MockVideoRenderData extends _i1.Mock implements _i4.VideoRenderData {
                 #shouldOptimizeForNetworkUse: shouldOptimizeForNetworkUse,
                 #imageBytesWithCropping: imageBytesWithCropping,
                 #loopCustomAudio: loopCustomAudio,
+                #pixelateFilters: pixelateFilters,
+                #fps: fps,
+                #codec: codec,
+                #encoderPreference: encoderPreference,
+                #adjustment: adjustment,
+                #vignetteFilter: vignetteFilter,
+                #textLayers: textLayers,
+                #shapeLayers: shapeLayers,
+                #stickerLayers: stickerLayers,
+                #videoOverlayLayers: videoOverlayLayers,
+                #backgroundCanvas: backgroundCanvas,
+                #resolutionPreset: resolutionPreset,
+                #audioCrossfade: audioCrossfade,
+                #originalAudioTrackIndex: originalAudioTrackIndex,
+                #replaceOriginalAudioPath: replaceOriginalAudioPath,
+                #loudnessNormalization: loudnessNormalization,
+                #audioDucking: audioDucking,
+                #audioPan: audioPan,
+                #voiceOverRecordingConfig: voiceOverRecordingConfig,
               }),
             ),
           )

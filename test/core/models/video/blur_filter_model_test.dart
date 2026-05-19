@@ -6,8 +6,8 @@ void main() {
     test('toMap serializes all fields', () {
       final filter = BlurFilter(
         blur: 2.5,
-        startTime: Duration(seconds: 1),
-        endTime: Duration(seconds: 3),
+        startTime: const Duration(seconds: 1),
+        endTime: const Duration(seconds: 3),
       );
 
       final map = filter.toMap();

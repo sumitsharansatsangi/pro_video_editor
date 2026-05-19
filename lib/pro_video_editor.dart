@@ -28,8 +28,24 @@ export 'core/models/exceptions/render_exceptions.dart';
 export 'core/models/exceptions/audio_exceptions.dart';
 export 'core/models/exceptions/unsupported_feature_exception.dart';
 export 'core/platform/platform_interface.dart';
+export 'core/services/export_queue.dart';
 export 'shared/models/time_range_mixin.dart';
 export 'shared/utils/converters.dart';
+
+/// New models added for P1–P5 features
+export 'core/models/video/pixelate_filter_model.dart';
+export 'core/models/video/video_transition_model.dart';
+export 'core/models/video/video_adjustment_model.dart';
+export 'core/models/video/vignette_filter_model.dart';
+export 'core/models/video/visual_layer_models.dart';
+export 'core/models/video/aspect_ratio_preset.dart';
+export 'core/models/video/video_fit_mode.dart';
+export 'core/models/video/video_codec.dart';
+export 'core/models/video/encoder_preference.dart';
+export 'core/models/video/still_image_segment_model.dart';
+export 'core/models/video/freeze_frame_model.dart';
+export 'core/models/audio/audio_fade_model.dart';
+export 'core/models/audio/audio_edit_models.dart';
 
 /// Thumbnails
 export 'core/models/thumbnail/key_frames_configs_model.dart';

@@ -7,6 +7,8 @@ class VideoEditorCapabilities {
     required this.platform,
     this.supportedFeatures = const {},
     this.experimentalFeatures = const {},
+    this.supportedVideoCodecs = const {},
+    this.supportedContainers = const {},
   });
 
   /// Platform name, for example `android`, `ios`, `macos`, `windows`, `linux`,
@@ -18,6 +20,12 @@ class VideoEditorCapabilities {
 
   /// Features that are implemented but may vary by device, codec, or platform.
   final Set<VideoEditorFeature> experimentalFeatures;
+
+  /// Codecs that are known to be available on this platform/device.
+  final Set<String> supportedVideoCodecs;
+
+  /// Containers/output formats that are known to be available.
+  final Set<String> supportedContainers;
 
   /// All features exposed by this package.
   static const allFeatures = VideoEditorFeature.values;
@@ -44,7 +52,9 @@ class VideoEditorCapabilities {
     return 'VideoEditorCapabilities('
         'platform: $platform, '
         'supportedFeatures: $supportedFeatures, '
-        'experimentalFeatures: $experimentalFeatures'
+        'experimentalFeatures: $experimentalFeatures, '
+        'supportedVideoCodecs: $supportedVideoCodecs, '
+        'supportedContainers: $supportedContainers'
         ')';
   }
 }

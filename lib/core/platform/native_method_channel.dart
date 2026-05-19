@@ -118,22 +118,84 @@ class MethodChannelProVideoEditor extends ProVideoEditor {
           VideoEditorFeature.colorFilters,
           VideoEditorFeature.customAudioTracks,
           VideoEditorFeature.streamingOptimization,
+          VideoEditorFeature.adjustment,
+          VideoEditorFeature.resolutionPresets,
+          VideoEditorFeature.exportQueue,
+          VideoEditorFeature.exportQueuePauseResume,
+          VideoEditorFeature.codecContainerReporting,
         },
-        experimentalFeatures: const {VideoEditorFeature.blur},
+        experimentalFeatures: const {
+          VideoEditorFeature.blur,
+          VideoEditorFeature.pixelateLayers,
+          VideoEditorFeature.perClipTransforms,
+          VideoEditorFeature.reverseVideo,
+          VideoEditorFeature.transitions,
+          VideoEditorFeature.audioFade,
+          VideoEditorFeature.fpsControl,
+          VideoEditorFeature.codecSelection,
+          VideoEditorFeature.encoderPreference,
+          VideoEditorFeature.vignette,
+          VideoEditorFeature.textLayers,
+          VideoEditorFeature.shapeLayers,
+          VideoEditorFeature.stickerLayers,
+          VideoEditorFeature.pictureInPicture,
+          VideoEditorFeature.backgroundCanvas,
+          VideoEditorFeature.audioCrossfade,
+          VideoEditorFeature.originalAudioTrackSelection,
+          VideoEditorFeature.replaceOriginalAudio,
+          VideoEditorFeature.loudnessNormalization,
+          VideoEditorFeature.audioDucking,
+          VideoEditorFeature.audioPan,
+          VideoEditorFeature.voiceOverRecording,
+          VideoEditorFeature.lut,
+          VideoEditorFeature.grain,
+          VideoEditorFeature.chromaKey,
+          VideoEditorFeature.masks,
+        },
+        supportedVideoCodecs: const {'h264', 'h265', 'vp9', 'av1'},
+        supportedContainers: const {'mp4', 'mov', 'webm', 'gif', 'mp3', 'wav'},
       );
     }
 
     if (Platform.isWindows) {
       return VideoEditorCapabilities(
         platform: platform,
-        supportedFeatures: const {VideoEditorFeature.metadata},
+        supportedFeatures: const {
+          VideoEditorFeature.metadata,
+          VideoEditorFeature.resolutionPresets,
+          VideoEditorFeature.exportQueue,
+          VideoEditorFeature.exportQueuePauseResume,
+          VideoEditorFeature.codecContainerReporting,
+        },
+        experimentalFeatures: const {
+          VideoEditorFeature.thumbnails,
+          VideoEditorFeature.keyFrames,
+          VideoEditorFeature.singleThumbnail,
+          VideoEditorFeature.frameThumbnail,
+        },
+        supportedVideoCodecs: const {'h264'},
+        supportedContainers: const {'mp4'},
       );
     }
 
     if (Platform.isLinux) {
       return VideoEditorCapabilities(
         platform: platform,
-        experimentalFeatures: const {VideoEditorFeature.metadata},
+        supportedFeatures: const {
+          VideoEditorFeature.metadata,
+          VideoEditorFeature.resolutionPresets,
+          VideoEditorFeature.exportQueue,
+          VideoEditorFeature.exportQueuePauseResume,
+          VideoEditorFeature.codecContainerReporting,
+        },
+        experimentalFeatures: const {
+          VideoEditorFeature.thumbnails,
+          VideoEditorFeature.keyFrames,
+          VideoEditorFeature.singleThumbnail,
+          VideoEditorFeature.frameThumbnail,
+        },
+        supportedVideoCodecs: const {'h264', 'vp9'},
+        supportedContainers: const {'mp4', 'webm'},
       );
     }
 

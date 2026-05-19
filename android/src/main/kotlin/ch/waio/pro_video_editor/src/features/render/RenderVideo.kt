@@ -239,7 +239,8 @@ class RenderVideo(private val context: Context) {
         lateinit var transformer: Transformer
 
         // Check if we need custom audio mixing with volume control
-        val hasCustomAudio = config.audioTracks.isNotEmpty()
+        val hasCustomAudio = config.audioTracks.isNotEmpty() ||
+                config.replaceOriginalAudioPath != null
 
         // Determine if video audio will be present in the mix
         // Video audio is removed when audio is disabled or all clips have volume 0
@@ -262,7 +263,8 @@ class RenderVideo(private val context: Context) {
         // For video-only volume adjustment, VolumeAudioProcessor is used per-clip instead
         // (AudioProcessors don't work with parallel sequences, but work fine with single sequence)
         if (hasCustomAudio) {
-            val trackVolumes = config.audioTracks.map { it.volume }
+            val trackVolumes = config.audioTracks.map { it.volume } +
+                    if (config.replaceOriginalAudioPath != null) listOf(1.0f) else emptyList()
             transformerBuilder.setAudioMixerFactory(
                 VolumeControlAudioMixerFactory(
                     trackVolumes = trackVolumes,

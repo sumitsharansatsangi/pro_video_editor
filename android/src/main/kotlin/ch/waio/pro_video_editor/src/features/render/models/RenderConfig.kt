@@ -211,9 +211,150 @@ data class ImageLayer(
     }
 }
 
+/**
+ * Shared timing and placement values for native-rasterized visual layers.
+ */
+data class VisualLayerStyleConfig(
+    val startUs: Long = -1L,
+    val endUs: Long = -1L,
+    val x: Double = 0.0,
+    val y: Double = 0.0,
+    val width: Double? = null,
+    val height: Double? = null,
+    val rotation: Float = 0f,
+    val opacity: Float = 1f,
+    val zIndex: Int = 0,
+    val anchorX: Float = 0.5f,
+    val anchorY: Float = 0.5f,
+    val blendMode: String = "sourceOver"
+) {
+    companion object {
+        fun fromMap(map: Map<String, Any?>): VisualLayerStyleConfig {
+            return VisualLayerStyleConfig(
+                startUs = (map["startUs"] as? Number)?.toLong() ?: -1L,
+                endUs = (map["endUs"] as? Number)?.toLong() ?: -1L,
+                x = (map["x"] as? Number)?.toDouble() ?: 0.0,
+                y = (map["y"] as? Number)?.toDouble() ?: 0.0,
+                width = (map["width"] as? Number)?.toDouble(),
+                height = (map["height"] as? Number)?.toDouble(),
+                rotation = (map["rotation"] as? Number)?.toFloat() ?: 0f,
+                opacity = (map["opacity"] as? Number)?.toFloat()?.coerceIn(0f, 1f) ?: 1f,
+                zIndex = (map["zIndex"] as? Number)?.toInt() ?: 0,
+                anchorX = (map["anchorX"] as? Number)?.toFloat() ?: 0.5f,
+                anchorY = (map["anchorY"] as? Number)?.toFloat() ?: 0.5f,
+                blendMode = map["blendMode"] as? String ?: "sourceOver"
+            )
+        }
+    }
+}
+
+data class TextLayerConfig(
+    val text: String,
+    val style: VisualLayerStyleConfig,
+    val fontFamily: String? = null,
+    val fontSize: Float = 24f,
+    val color: String = "#FFFFFFFF",
+    val backgroundColor: String? = null,
+    val align: String = "left",
+    val bold: Boolean = false,
+    val italic: Boolean = false,
+    val letterSpacing: Float = 0f,
+    val lineHeight: Float? = null
+) {
+    companion object {
+        fun fromMap(map: Map<String, Any?>): TextLayerConfig {
+            return TextLayerConfig(
+                text = map["text"] as? String ?: "",
+                style = VisualLayerStyleConfig.fromMap(map),
+                fontFamily = map["fontFamily"] as? String,
+                fontSize = (map["fontSize"] as? Number)?.toFloat() ?: 24f,
+                color = map["color"] as? String ?: "#FFFFFFFF",
+                backgroundColor = map["backgroundColor"] as? String,
+                align = map["align"] as? String ?: "left",
+                bold = map["bold"] as? Boolean ?: false,
+                italic = map["italic"] as? Boolean ?: false,
+                letterSpacing = (map["letterSpacing"] as? Number)?.toFloat() ?: 0f,
+                lineHeight = (map["lineHeight"] as? Number)?.toFloat()
+            )
+        }
+    }
+}
+
+data class ShapeLayerConfig(
+    val type: String,
+    val style: VisualLayerStyleConfig,
+    val fillColor: String? = null,
+    val strokeColor: String = "#FFFFFFFF",
+    val strokeWidth: Float = 2f,
+    val cornerRadius: Float = 0f
+) {
+    companion object {
+        fun fromMap(map: Map<String, Any?>): ShapeLayerConfig {
+            return ShapeLayerConfig(
+                type = map["type"] as? String ?: "rectangle",
+                style = VisualLayerStyleConfig.fromMap(map),
+                fillColor = map["fillColor"] as? String,
+                strokeColor = map["strokeColor"] as? String ?: "#FFFFFFFF",
+                strokeWidth = (map["strokeWidth"] as? Number)?.toFloat() ?: 2f,
+                cornerRadius = (map["cornerRadius"] as? Number)?.toFloat() ?: 0f
+            )
+        }
+    }
+}
+
+data class StickerLayerConfig(
+    val value: String,
+    val style: VisualLayerStyleConfig,
+    val pack: String? = null,
+    val label: String? = null
+) {
+    companion object {
+        fun fromMap(map: Map<String, Any?>): StickerLayerConfig {
+            return StickerLayerConfig(
+                value = map["value"] as? String ?: "",
+                style = VisualLayerStyleConfig.fromMap(map),
+                pack = map["pack"] as? String,
+                label = map["label"] as? String
+            )
+        }
+    }
+}
+
+/**
+ * Typed colour-grading adjustments passed from Flutter.
+ *
+ * All fields are nullable — a null value means that adjustment is not applied.
+ */
+data class AdjustmentConfig(
+    val brightness: Double?,
+    val contrast: Double?,
+    val saturation: Double?,
+    val exposure: Double?,
+    val warmth: Double?,
+    val tint: Double?,
+    val sharpen: Double?
+) {
+    companion object {
+        fun fromMap(map: Map<String, Any?>): AdjustmentConfig {
+            return AdjustmentConfig(
+                brightness = (map["brightness"] as? Number)?.toDouble(),
+                contrast = (map["contrast"] as? Number)?.toDouble(),
+                saturation = (map["saturation"] as? Number)?.toDouble(),
+                exposure = (map["exposure"] as? Number)?.toDouble(),
+                warmth = (map["warmth"] as? Number)?.toDouble(),
+                tint = (map["tint"] as? Number)?.toDouble(),
+                sharpen = (map["sharpen"] as? Number)?.toDouble()
+            )
+        }
+    }
+}
+
 data class RenderConfig(
     val videoClips: List<VideoClip>,
     val imageLayers: List<ImageLayer> = emptyList(),
+    val textLayers: List<TextLayerConfig> = emptyList(),
+    val shapeLayers: List<ShapeLayerConfig> = emptyList(),
+    val stickerLayers: List<StickerLayerConfig> = emptyList(),
     val outputFormat: String,
     val outputPath: String? = null,
     val rotateTurns: Int? = null,
@@ -231,6 +372,7 @@ data class RenderConfig(
     val colorFilters: List<ColorFilterConfig> = emptyList(),
     val blurFilters: List<BlurFilterConfig> = emptyList(),
     val audioTracks: List<AudioTrackConfig> = emptyList(),
+    val replaceOriginalAudioPath: String? = null,
     val blur: Double? = null,
     /** Global start time in microseconds for trimming the final composition */
     val startUs: Long? = null,
@@ -239,7 +381,9 @@ data class RenderConfig(
     /** Whether to optimize the video for network streaming (fast start). */
     val shouldOptimizeForNetworkUse: Boolean = true,
     /** Whether to apply cropping to the image overlay along with the video. */
-    val imageBytesWithCropping: Boolean = false
+    val imageBytesWithCropping: Boolean = false,
+    /** Typed colour-grading adjustments (brightness, contrast, etc.). */
+    val adjustment: AdjustmentConfig? = null
 ) {
     override fun equals(other: Any?): Boolean {
         if (this === other) return true
@@ -247,6 +391,10 @@ data class RenderConfig(
         other as RenderConfig
         return videoClips == other.videoClips &&
                 imageLayers == other.imageLayers &&
+                textLayers == other.textLayers &&
+                shapeLayers == other.shapeLayers &&
+                stickerLayers == other.stickerLayers &&
+                replaceOriginalAudioPath == other.replaceOriginalAudioPath &&
                 outputFormat == other.outputFormat &&
                 outputPath == other.outputPath
     }
@@ -254,6 +402,10 @@ data class RenderConfig(
     override fun hashCode(): Int {
         var result = videoClips.hashCode()
         result = 31 * result + imageLayers.hashCode()
+        result = 31 * result + textLayers.hashCode()
+        result = 31 * result + shapeLayers.hashCode()
+        result = 31 * result + stickerLayers.hashCode()
+        result = 31 * result + (replaceOriginalAudioPath?.hashCode() ?: 0)
         result = 31 * result + outputFormat.hashCode()
         result = 31 * result + (outputPath?.hashCode() ?: 0)
         return result
@@ -338,6 +490,29 @@ data class RenderConfig(
 
             Log.d(PACKAGE_TAG, "Parsed ${imageLayers.size} image layer(s)")
 
+            @Suppress("UNCHECKED_CAST")
+            val textLayersRaw = call.argument<List<Map<String, Any?>>>("textLayers")
+            val textLayers = textLayersRaw
+                ?.map { TextLayerConfig.fromMap(it) }
+                ?.filter { it.text.isNotEmpty() }
+                ?: emptyList()
+            Log.d(PACKAGE_TAG, "Parsed ${textLayers.size} text layer(s)")
+
+            @Suppress("UNCHECKED_CAST")
+            val shapeLayersRaw = call.argument<List<Map<String, Any?>>>("shapeLayers")
+            val shapeLayers = shapeLayersRaw
+                ?.map { ShapeLayerConfig.fromMap(it) }
+                ?: emptyList()
+            Log.d(PACKAGE_TAG, "Parsed ${shapeLayers.size} shape layer(s)")
+
+            @Suppress("UNCHECKED_CAST")
+            val stickerLayersRaw = call.argument<List<Map<String, Any?>>>("stickerLayers")
+            val stickerLayers = stickerLayersRaw
+                ?.map { StickerLayerConfig.fromMap(it) }
+                ?.filter { it.value.isNotEmpty() }
+                ?: emptyList()
+            Log.d(PACKAGE_TAG, "Parsed ${stickerLayers.size} sticker layer(s)")
+
             // Parse color filters
             @Suppress("UNCHECKED_CAST")
             val colorFiltersRaw = call.argument<List<Map<String, Any?>>>("colorFilters")
@@ -360,6 +535,9 @@ data class RenderConfig(
             return RenderConfig(
                 videoClips = videoClips,
                 imageLayers = imageLayers,
+                textLayers = textLayers,
+                shapeLayers = shapeLayers,
+                stickerLayers = stickerLayers,
                 outputFormat = call.argument<String>("outputFormat") ?: "mp4",
                 outputPath = call.argument<String>("outputPath"),
                 rotateTurns = call.argument<Number>("rotateTurns")?.toInt(),
@@ -377,12 +555,15 @@ data class RenderConfig(
                 colorFilters = colorFilters,
                 blurFilters = blurFilters,
                 audioTracks = audioTracks,
+                replaceOriginalAudioPath = call.argument<String>("replaceOriginalAudioPath"),
                 blur = call.argument<Number>("blur")?.toDouble(),
                 startUs = call.argument<Number?>("startUs")?.toLong(),
                 endUs = call.argument<Number?>("endUs")?.toLong(),
                 shouldOptimizeForNetworkUse = call.argument<Boolean>("shouldOptimizeForNetworkUse")
                     ?: true,
-                imageBytesWithCropping = call.argument<Boolean>("imageBytesWithCropping") ?: false
+                imageBytesWithCropping = call.argument<Boolean>("imageBytesWithCropping") ?: false,
+                adjustment = call.argument<Map<String, Any?>>("adjustment")
+                    ?.let { AdjustmentConfig.fromMap(it) }
             )
         }
     }

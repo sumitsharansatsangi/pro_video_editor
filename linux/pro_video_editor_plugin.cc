@@ -106,7 +106,7 @@ static void pro_video_editor_plugin_handle_method_call(
 
     return;  // Don't respond here — async will handle it
 
-  } else if (strcmp(method, "createVideoThumbnails") == 0) {
+  } else if (strcmp(method, "getThumbnails") == 0) {
     pro_video_editor::HandleGenerateThumbnails(
         args_map,
         std::make_unique<flutter::MethodResultFunctions<flutter::EncodableValue>>(

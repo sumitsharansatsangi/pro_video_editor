@@ -1,6 +1,7 @@
 // ignore_for_file: public_member_api_docs, sort_constructors_first
 import 'dart:convert';
 
+import 'package:flutter/foundation.dart';
 import 'package:pro_video_editor/pro_video_editor.dart';
 import 'package:pro_video_editor/shared/utils/parser/double_parser.dart';
 import 'package:pro_video_editor/shared/utils/parser/int_parser.dart';
@@ -17,18 +18,23 @@ class VideoSegment {
     this.endTime,
     this.volume,
     this.playbackSpeed,
-  })  : assert(
-          startTime == null || endTime == null || startTime < endTime,
-          'startTime must be before endTime',
-        ),
-        assert(
-          volume == null || volume >= 0,
-          '[volume] must be greater than or equal to 0',
-        ),
-        assert(
-          playbackSpeed == null || playbackSpeed > 0,
-          '[playbackSpeed] must be greater than 0',
-        );
+    this.transform,
+    this.colorFilters = const [],
+    this.blurFilters = const [],
+    this.reversed = false,
+    this.transition,
+  }) : assert(
+         startTime == null || endTime == null || startTime < endTime,
+         'startTime must be before endTime',
+       ),
+       assert(
+         volume == null || volume >= 0,
+         '[volume] must be greater than or equal to 0',
+       ),
+       assert(
+         playbackSpeed == null || playbackSpeed > 0,
+         '[playbackSpeed] must be greater than 0',
+       );
 
   /// The video source for this clip.
   ///
@@ -62,6 +68,42 @@ class VideoSegment {
   /// If null, the original speed is used.
   final double? playbackSpeed;
 
+  /// Per-clip crop, rotate, flip, and scale transforms.
+  ///
+  /// When null, no per-clip transform is applied and the global transform
+  /// from [VideoRenderData] is used instead.
+  ///
+  /// **Platform support:** Requires [VideoEditorFeature.perClipTransforms].
+  final ExportTransform? transform;
+
+  /// Per-clip colour matrix filters.
+  ///
+  /// Applied after any global colour filters from [VideoRenderData].
+  ///
+  /// **Platform support:** Requires [VideoEditorFeature.perClipTransforms].
+  final List<ColorFilter> colorFilters;
+
+  /// Per-clip blur filters with optional time ranges.
+  ///
+  /// **Platform support:** Requires [VideoEditorFeature.perClipTransforms].
+  final List<BlurFilter> blurFilters;
+
+  /// Whether to reverse the clip's playback direction.
+  ///
+  /// When `true` the clip plays backwards. Audio is muted for reversed clips.
+  ///
+  /// **Default:** `false`
+  ///
+  /// **Platform support:** Requires [VideoEditorFeature.reverseVideo].
+  final bool reversed;
+
+  /// The transition to apply between this segment and the next one.
+  ///
+  /// When null, clips are joined with a hard cut.
+  ///
+  /// **Platform support:** Requires [VideoEditorFeature.transitions].
+  final VideoTransition? transition;
+
   /// Converts this clip to a map for platform channel communication.
   Future<Map<String, dynamic>> toAsyncMap() async {
     final inputPath = await video.safeFilePath();
@@ -72,16 +114,25 @@ class VideoSegment {
       'endUs': endTime?.inMicroseconds,
       'volume': volume,
       'playbackSpeed': playbackSpeed,
+      'reversed': reversed,
+      if (transform != null) ...transform!.toMap(),
+      'colorFilters': colorFilters.map((f) => f.toMap()).toList(),
+      'blurFilters': blurFilters.map((f) => f.toMap()).toList(),
+      if (transition != null) 'transition': transition!.toMap(),
     };
   }
 
-  /// Creates a copy with updated values.
   VideoSegment copyWith({
     EditorVideo? video,
     Duration? startTime,
     Duration? endTime,
     double? volume,
     double? playbackSpeed,
+    ExportTransform? transform,
+    List<ColorFilter>? colorFilters,
+    List<BlurFilter>? blurFilters,
+    bool? reversed,
+    VideoTransition? transition,
   }) {
     return VideoSegment(
       video: video ?? this.video,
@@ -89,6 +140,11 @@ class VideoSegment {
       endTime: endTime ?? this.endTime,
       volume: volume ?? this.volume,
       playbackSpeed: playbackSpeed ?? this.playbackSpeed,
+      transform: transform ?? this.transform,
+      colorFilters: colorFilters ?? this.colorFilters,
+      blurFilters: blurFilters ?? this.blurFilters,
+      reversed: reversed ?? this.reversed,
+      transition: transition ?? this.transition,
     );
   }
 
@@ -100,7 +156,12 @@ class VideoSegment {
         other.startTime == startTime &&
         other.endTime == endTime &&
         other.volume == volume &&
-        other.playbackSpeed == playbackSpeed;
+        other.playbackSpeed == playbackSpeed &&
+        other.transform == transform &&
+        listEquals(other.colorFilters, colorFilters) &&
+        listEquals(other.blurFilters, blurFilters) &&
+        other.reversed == reversed &&
+        other.transition == transition;
   }
 
   @override
@@ -109,7 +170,12 @@ class VideoSegment {
         startTime.hashCode ^
         endTime.hashCode ^
         volume.hashCode ^
-        playbackSpeed.hashCode;
+        playbackSpeed.hashCode ^
+        transform.hashCode ^
+        colorFilters.hashCode ^
+        blurFilters.hashCode ^
+        reversed.hashCode ^
+        transition.hashCode;
   }
 
   @override
@@ -118,7 +184,12 @@ class VideoSegment {
         'startTime: $startTime, '
         'endTime: $endTime, '
         'volume: $volume, '
-        'playbackSpeed: $playbackSpeed)';
+        'playbackSpeed: $playbackSpeed, '
+        'transform: $transform, '
+        'colorFilters: $colorFilters, '
+        'blurFilters: $blurFilters, '
+        'reversed: $reversed, '
+        'transition: $transition)';
   }
 
   Map<String, dynamic> toMap() {
@@ -128,6 +199,11 @@ class VideoSegment {
       'endTime': endTime?.inMicroseconds,
       'volume': volume,
       'playbackSpeed': playbackSpeed,
+      'transform': transform?.toMap(),
+      'colorFilters': colorFilters.map((f) => f.toMap()).toList(),
+      'blurFilters': blurFilters.map((f) => f.toMap()).toList(),
+      'reversed': reversed,
+      'transition': transition?.toMap(),
     };
   }
 
@@ -142,6 +218,19 @@ class VideoSegment {
           : null,
       volume: tryParseDouble(map['volume']),
       playbackSpeed: tryParseDouble(map['playbackSpeed']),
+      transform: map['transform'] != null
+          ? ExportTransform.fromMap(map['transform'] as Map<String, dynamic>)
+          : null,
+      colorFilters: ((map['colorFilters'] as List?) ?? const [])
+          .map((x) => ColorFilter.fromMap(x as Map<String, dynamic>))
+          .toList(),
+      blurFilters: ((map['blurFilters'] as List?) ?? const [])
+          .map((x) => BlurFilter.fromMap(x as Map<String, dynamic>))
+          .toList(),
+      reversed: map['reversed'] as bool? ?? false,
+      transition: map['transition'] != null
+          ? VideoTransition.fromMap(map['transition'] as Map<String, dynamic>)
+          : null,
     );
   }
 

@@ -6,6 +6,23 @@ import 'package:pro_video_editor/shared/utils/parser/int_parser.dart';
 
 /// A blur effect with an optional active time range.
 class BlurFilter with TimeRangeMixin {
+
+  /// Creates a blur filter from a map.
+  factory BlurFilter.fromMap(Map<String, dynamic> map) {
+    return BlurFilter(
+      blur: safeParseDouble(map['blur']),
+      startTime: map['startUs'] != null
+          ? Duration(microseconds: safeParseInt(map['startUs']))
+          : null,
+      endTime: map['endUs'] != null
+          ? Duration(microseconds: safeParseInt(map['endUs']))
+          : null,
+    );
+  }
+
+  /// Creates a blur filter from JSON.
+  factory BlurFilter.fromJson(String source) =>
+      BlurFilter.fromMap(json.decode(source) as Map<String, dynamic>);
   /// Creates a blur filter.
   BlurFilter({required this.blur, this.startTime, this.endTime})
     : assert(blur >= 0, 'blur must be greater than or equal to 0'),
@@ -32,23 +49,6 @@ class BlurFilter with TimeRangeMixin {
     };
   }
 
-  /// Creates a blur filter from a map.
-  factory BlurFilter.fromMap(Map<String, dynamic> map) {
-    return BlurFilter(
-      blur: safeParseDouble(map['blur']),
-      startTime: map['startUs'] != null
-          ? Duration(microseconds: safeParseInt(map['startUs']))
-          : null,
-      endTime: map['endUs'] != null
-          ? Duration(microseconds: safeParseInt(map['endUs']))
-          : null,
-    );
-  }
-
   /// Converts this filter to JSON.
   String toJson() => json.encode(toMap());
-
-  /// Creates a blur filter from JSON.
-  factory BlurFilter.fromJson(String source) =>
-      BlurFilter.fromMap(json.decode(source) as Map<String, dynamic>);
 }
