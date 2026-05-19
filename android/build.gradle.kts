@@ -2,7 +2,7 @@ import org.jetbrains.kotlin.gradle.dsl.JvmTarget
 
 plugins {
     id("com.android.library")
-    id("org.jetbrains.kotlin.android")
+    kotlin("android")
 }
 
 group = "ch.waio.pro_video_editor"
@@ -13,9 +13,10 @@ repositories {
     mavenCentral()
 }
 
-val media3Version = "1.10.0"
+val media3Version = "1.10.1"
 
 android {
+
     namespace = "ch.waio.pro_video_editor"
 
     compileSdk = 37
@@ -29,13 +30,8 @@ android {
         targetCompatibility = JavaVersion.VERSION_21
     }
 
-    kotlin {
-        compilerOptions {
-            jvmTarget.set(JvmTarget.JVM_21)
-        }
-    }
-
     sourceSets {
+
         getByName("main") {
             java.srcDirs("src/main/kotlin")
         }
@@ -47,9 +43,11 @@ android {
 
     testOptions {
         unitTests.all {
-            it.useJUnitPlatform()
 
-            it.testLogging {
+            useJUnitPlatform()
+
+            testLogging {
+
                 events(
                     "passed",
                     "skipped",
@@ -61,14 +59,21 @@ android {
                 showStandardStreams = true
             }
 
-            it.outputs.upToDateWhen { false }
+            outputs.upToDateWhen { false }
         }
     }
 }
 
+kotlin {
+    compilerOptions {
+        jvmTarget.set(JvmTarget.JVM_21)
+    }
+}
+
 dependencies {
+
     testImplementation(kotlin("test"))
-    testImplementation("org.mockito:mockito-core:5.1.1")
+    testImplementation("org.mockito:mockito-core:5.23.0")
 
     // Media3
     implementation("androidx.media3:media3-common:$media3Version")
