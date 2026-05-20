@@ -32,9 +32,9 @@ fun applyAdjustment(
         val scale = (b.toFloat() + 1f).coerceIn(0f, 2f)
         Log.d(RENDER_TAG, "Applying brightness: input=$b, scale=$scale")
         videoEffects += RgbAdjustment.Builder()
-            .scaleRed(scale)
-            .scaleGreen(scale)
-            .scaleBlue(scale)
+            .setRedScale(scale)
+            .setGreenScale(scale)
+            .setBlueScale(scale)
             .build()
     }
 
@@ -58,9 +58,9 @@ fun applyAdjustment(
         val scale = Math.pow(2.0, e).toFloat()
         Log.d(RENDER_TAG, "Applying exposure: $e EV, scale=$scale")
         videoEffects += RgbAdjustment.Builder()
-            .scaleRed(scale)
-            .scaleGreen(scale)
-            .scaleBlue(scale)
+            .setRedScale(scale)
+            .setGreenScale(scale)
+            .setBlueScale(scale)
             .build()
     }
 
@@ -69,8 +69,8 @@ fun applyAdjustment(
         val wf = w.toFloat()
         Log.d(RENDER_TAG, "Applying warmth: $wf")
         videoEffects += RgbAdjustment.Builder()
-            .scaleRed((1f + wf * 0.3f).coerceIn(0f, 2f))
-            .scaleBlue((1f - wf * 0.3f).coerceIn(0f, 2f))
+            .setRedScale((1f + wf * 0.3f).coerceIn(0f, 2f))
+            .setBlueScale((1f - wf * 0.3f).coerceIn(0f, 2f))
             .build()
     }
 
@@ -79,7 +79,7 @@ fun applyAdjustment(
         val tf = t.toFloat()
         Log.d(RENDER_TAG, "Applying tint: $tf")
         videoEffects += RgbAdjustment.Builder()
-            .scaleGreen((1f - tf * 0.3f).coerceIn(0f, 2f))
+            .setGreenScale((1f - tf * 0.3f).coerceIn(0f, 2f))
             .build()
     }
 
