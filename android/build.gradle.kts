@@ -1,3 +1,5 @@
+import com.android.build.api.dsl.LibraryExtension
+import org.gradle.api.tasks.testing.Test
 import org.jetbrains.kotlin.gradle.dsl.JvmTarget
 
 plugins {
@@ -15,7 +17,7 @@ repositories {
 
 val media3Version = "1.10.1"
 
-android {
+extensions.configure<LibraryExtension>("android") {
 
     namespace = "ch.waio.pro_video_editor"
 
@@ -33,16 +35,22 @@ android {
     sourceSets {
 
         getByName("main") {
-            java.srcDirs("src/main/kotlin")
+            java.setSrcDirs(
+                listOf("src/main/kotlin")
+            )
         }
 
         getByName("test") {
-            java.srcDirs("src/test/kotlin")
+            java.setSrcDirs(
+                listOf("src/test/kotlin")
+            )
         }
     }
 
     testOptions {
         unitTests.all {
+
+            this as Test
 
             useJUnitPlatform()
 
@@ -72,7 +80,14 @@ kotlin {
 
 dependencies {
 
+    // Kotlin test
     testImplementation(kotlin("test"))
+
+    // JUnit 5
+    testImplementation("org.junit.jupiter:junit-jupiter-api:5.13.4")
+    testRuntimeOnly("org.junit.jupiter:junit-jupiter-engine:5.13.4")
+
+    // Mockito
     testImplementation("org.mockito:mockito-core:5.23.0")
 
     // Media3
