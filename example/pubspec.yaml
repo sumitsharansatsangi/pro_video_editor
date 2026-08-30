@@ -13,7 +13,7 @@ dependencies:
     path: ../
 
 
-  intl: ^0.20.1
+  intl: ^0.20.3
   cupertino_icons: ^1.0.8
 
   pro_image_editor: ^12.4.3
