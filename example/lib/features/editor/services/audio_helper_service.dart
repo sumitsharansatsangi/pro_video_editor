@@ -23,7 +23,7 @@ class AudioHelperService {
   /// settings.
   Future<void> initialize() {
     return _audioPlayer.setAudioContext(
-       AudioContext(
+      AudioContext(
         android: const AudioContextAndroid(
           isSpeakerphoneOn: false,
           stayAwake: false,

@@ -8,10 +8,6 @@ import 'dart:typed_data';
 
 import 'package:flutter_web_plugins/flutter_web_plugins.dart';
 import 'package:pro_video_editor/core/models/audio/audio_extract_configs_model.dart';
-import 'package:pro_video_editor/core/models/exceptions/unsupported_feature_exception.dart';
-import 'package:pro_video_editor/core/models/platform/video_editor_capabilities.dart';
-import 'package:pro_video_editor/core/models/platform/video_editor_feature.dart';
-import 'package:pro_video_editor/core/models/thumbnail/frame_thumbnail_configs_model.dart';
 import 'package:pro_video_editor/core/models/video/progress_model.dart';
 import 'package:web/web.dart' as web;
 
@@ -19,9 +15,12 @@ import '/core/models/platform/native_log_level.dart';
 import '/core/models/thumbnail/key_frames_configs_model.dart';
 import '/core/models/thumbnail/single_thumbnail_configs_model.dart';
 import '/core/models/thumbnail/thumbnail_configs_model.dart';
+import '/core/models/thumbnail/thumbnail_frame_model.dart';
 import '/core/models/video/editor_video_model.dart';
+import '/core/models/video/split_video_model.dart';
 import '/core/models/video/video_metadata_model.dart';
 import '/core/services/web/web_manager.dart';
+import '../models/video/stop_motion_render_data_model.dart';
 import '../models/video/video_render_data_model.dart';
 import 'platform_interface.dart';
 
@@ -62,20 +61,6 @@ class ProVideoEditorWeb extends ProVideoEditor {
   }
 
   @override
-  Future<VideoEditorCapabilities> getSupportedFeatures() async {
-    return const VideoEditorCapabilities(
-      platform: 'web',
-      supportedFeatures: {
-        VideoEditorFeature.metadata,
-        VideoEditorFeature.thumbnails,
-        VideoEditorFeature.keyFrames,
-        VideoEditorFeature.singleThumbnail,
-        VideoEditorFeature.frameThumbnail,
-      },
-    );
-  }
-
-  @override
   Future<VideoMetadata> getMetadata(
     EditorVideo value, {
     bool checkStreamingOptimization = false,
@@ -90,7 +75,9 @@ class ProVideoEditorWeb extends ProVideoEditor {
     EditorVideo value, {
     NativeLogLevel? nativeLogLevel,
   }) {
-    throw _unsupported(VideoEditorFeature.hasAudioTrack);
+    throw UnimplementedError(
+      'hasAudioTrack() has not been implemented on web.',
+    );
   }
 
   @override
@@ -102,6 +89,23 @@ class ProVideoEditorWeb extends ProVideoEditor {
       value,
       onProgress: (progress) => _updateProgress(value.id, progress),
     );
+  }
+
+  @override
+  Stream<ThumbnailFrame> getThumbnailStream(
+    ThumbnailConfigs value, {
+    NativeLogLevel? nativeLogLevel,
+  }) async* {
+    // The web generator decodes in one go, so the stream degrades to the
+    // complete set delivered frame by frame.
+    final frames = await getThumbnails(value, nativeLogLevel: nativeLogLevel);
+    for (var i = 0; i < frames.length; i++) {
+      yield ThumbnailFrame(
+        indices: [i],
+        bytes: frames[i],
+        progress: (i + 1) / frames.length,
+      );
+    }
   }
 
   @override
@@ -148,32 +152,11 @@ class ProVideoEditorWeb extends ProVideoEditor {
   }
 
   @override
-  Future<Uint8List?> getFrameThumbnail(
-    FrameThumbnailConfigs value, {
-    NativeLogLevel? nativeLogLevel,
-  }) async {
-    final results = await _manager.getThumbnails(
-      ThumbnailConfigs(
-        video: value.video,
-        outputSize: value.outputSize,
-        outputFormat: value.outputFormat,
-        boxFit: value.boxFit,
-        id: value.id,
-        jpegQuality: value.jpegQuality,
-        timestamps: [value.timestamp],
-      ),
-      onProgress: (progress) => _updateProgress(value.id, progress),
-    );
-
-    return results.isNotEmpty ? results.first : null;
-  }
-
-  @override
   Future<Uint8List> extractAudio(
     AudioExtractConfigs value, {
     NativeLogLevel? nativeLogLevel,
   }) {
-    throw _unsupported(VideoEditorFeature.extractAudio);
+    throw UnimplementedError('extractAudio() has not been implemented on web.');
   }
 
   @override
@@ -182,7 +165,9 @@ class ProVideoEditorWeb extends ProVideoEditor {
     AudioExtractConfigs value, {
     NativeLogLevel? nativeLogLevel,
   }) {
-    throw _unsupported(VideoEditorFeature.extractAudioToFile);
+    throw UnimplementedError(
+      'extractAudioToFile() has not been implemented on web.',
+    );
   }
 
   @override
@@ -190,7 +175,7 @@ class ProVideoEditorWeb extends ProVideoEditor {
     VideoRenderData value, {
     NativeLogLevel? nativeLogLevel,
   }) {
-    throw _unsupported(VideoEditorFeature.renderVideo);
+    throw UnimplementedError('renderVideo() has not been implemented.');
   }
 
   @override
@@ -199,12 +184,39 @@ class ProVideoEditorWeb extends ProVideoEditor {
     VideoRenderData value, {
     NativeLogLevel? nativeLogLevel,
   }) {
-    throw _unsupported(VideoEditorFeature.renderVideoToFile);
+    throw UnimplementedError('renderVideoToFile() has not been implemented.');
+  }
+
+  @override
+  Future<Uint8List> renderStopMotion(
+    StopMotionRenderData value, {
+    NativeLogLevel? nativeLogLevel,
+  }) {
+    throw UnimplementedError('renderStopMotion() is not supported on web.');
+  }
+
+  @override
+  Future<String> renderStopMotionToFile(
+    String filePath,
+    StopMotionRenderData value, {
+    NativeLogLevel? nativeLogLevel,
+  }) {
+    throw UnimplementedError(
+      'renderStopMotionToFile() is not supported on web.',
+    );
+  }
+
+  @override
+  Future<List<String>> splitVideo(
+    SplitVideoModel value, {
+    NativeLogLevel? nativeLogLevel,
+  }) {
+    throw UnimplementedError('splitVideo() is not supported on web.');
   }
 
   @override
   Future<void> cancel(String taskId) {
-    throw _unsupported(VideoEditorFeature.cancel);
+    throw UnimplementedError('cancel() has not been implemented.');
   }
 
   @override
@@ -221,9 +233,5 @@ class ProVideoEditorWeb extends ProVideoEditor {
   /// [progress] Progress value between 0.0 and 1.0.
   void _updateProgress(String taskId, double progress) {
     progressCtrl.add(ProgressModel(id: taskId, progress: progress));
-  }
-
-  UnsupportedFeatureException _unsupported(VideoEditorFeature feature) {
-    return UnsupportedFeatureException(feature: feature, platform: 'web');
   }
 }

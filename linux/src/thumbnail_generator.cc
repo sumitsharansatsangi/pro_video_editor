@@ -1,22 +1,22 @@
 #include "thumbnail_generator.h"
 
-#include <flutter/standard_method_codec.h>
+#include <flutter_linux/flutter_linux.h>
 
 #include <fstream>
 #include <string>
 #include <vector>
 #include <sstream>
-#include <iostream>
 #include <chrono>
 #include <filesystem>
 #include <future>
 #include <cstdlib>
 #include <iomanip>
+#include <cmath>
 
 namespace fs = std::filesystem;
 namespace pro_video_editor {
 
-std::string GenerateTempFilename(const std::string& prefix, const std::string& extension) {
+static std::string GenerateTempFilename(const std::string& prefix, const std::string& extension) {
     std::stringstream filename;
     auto now = std::chrono::system_clock::now();
     auto time = std::chrono::system_clock::to_time_t(now);
@@ -31,55 +31,77 @@ std::string GenerateTempFilename(const std::string& prefix, const std::string& e
     return filename.str();
 }
 
-void HandleGenerateThumbnails(
-    const flutter::EncodableMap& args,
-    std::unique_ptr<flutter::MethodResult<flutter::EncodableValue>> result) {
+static bool WriteBytesToFile(const std::string& path, const uint8_t* data, size_t size) {
+    std::ofstream out(path, std::ios::binary);
+    if (!out.is_open()) return false;
+    out.write(reinterpret_cast<const char*>(data), size);
+    return true;
+}
 
-    const auto* inputPath = std::get_if<std::string>(&args.at(flutter::EncodableValue("inputPath")));
-    const auto* timestampsList = std::get_if<flutter::EncodableList>(&args.at(flutter::EncodableValue("timestamps")));
-    const auto* formatStr = std::get_if<std::string>(&args.at(flutter::EncodableValue("outputFormat")));
-    const auto* widthInt = std::get_if<int>(&args.at(flutter::EncodableValue("outputWidth")));
-    const auto* widthLong = std::get_if<int64_t>(&args.at(flutter::EncodableValue("outputWidth")));
+FlMethodResponse* HandleGenerateThumbnails(FlValue* args) {
+    FlValue* videoBytesVal  = fl_value_lookup_string(args, "videoBytes");
+    FlValue* timestampsVal  = fl_value_lookup_string(args, "timestamps");
+    FlValue* formatVal      = fl_value_lookup_string(args, "thumbnailFormat");
+    FlValue* extensionVal   = fl_value_lookup_string(args, "extension");
+    FlValue* widthVal       = fl_value_lookup_string(args, "imageWidth");
 
-    if (!inputPath || !timestampsList || !formatStr || (!widthInt && !widthLong)) {
-        result->Error("InvalidArgument", "Missing required parameters");
-        return;
+    if (!videoBytesVal || fl_value_get_type(videoBytesVal) != FL_VALUE_TYPE_UINT8_LIST ||
+        !timestampsVal || fl_value_get_type(timestampsVal) != FL_VALUE_TYPE_LIST ||
+        !formatVal    || fl_value_get_type(formatVal)    != FL_VALUE_TYPE_STRING ||
+        !extensionVal || fl_value_get_type(extensionVal) != FL_VALUE_TYPE_STRING ||
+        !widthVal) {
+        return FL_METHOD_RESPONSE(fl_method_error_response_new(
+            "InvalidArgument", "Missing required parameters", nullptr));
     }
 
-    int roundedWidth = widthInt ? *widthInt : static_cast<int>(*widthLong);
+    const uint8_t* videoData     = fl_value_get_uint8_list(videoBytesVal);
+    size_t         videoDataSize = fl_value_get_length(videoBytesVal);
 
-    std::string imageExt = *formatStr;
+    double widthDouble = 0.0;
+    if (fl_value_get_type(widthVal) == FL_VALUE_TYPE_FLOAT) {
+        widthDouble = fl_value_get_float(widthVal);
+    } else if (fl_value_get_type(widthVal) == FL_VALUE_TYPE_INT) {
+        widthDouble = static_cast<double>(fl_value_get_int(widthVal));
+    }
+    int roundedWidth = static_cast<int>(std::round(widthDouble));
+
+    std::string videoExt = fl_value_get_string(extensionVal);
+    if (videoExt.empty() || videoExt[0] != '.') videoExt = "." + videoExt;
+
+    std::string imageExt = fl_value_get_string(formatVal);
     if (imageExt.empty() || imageExt[0] != '.') imageExt = "." + imageExt;
 
-    // Assume `ffmpeg` is in system PATH on Linux
+    std::string tempVideoPath = GenerateTempFilename("video_temp", videoExt);
+    if (!WriteBytesToFile(tempVideoPath, videoData, videoDataSize)) {
+        return FL_METHOD_RESPONSE(fl_method_error_response_new(
+            "FileError", "Failed to write temp video file", nullptr));
+    }
+
     std::string ffmpegPath = "ffmpeg";
-
+    size_t count = fl_value_get_length(timestampsVal);
     std::vector<std::future<void>> futures;
-    std::vector<flutter::EncodableValue> thumbnails(timestampsList->size());
+    std::vector<std::vector<uint8_t>> thumbnails(count);
 
-    int index = 0;
-    for (const auto& tsValue : *timestampsList) {
-        if (!std::holds_alternative<int>(tsValue)) {
-            ++index;
+    for (size_t i = 0; i < count; i++) {
+        FlValue* tsVal = fl_value_get_list_value(timestampsVal, i);
+        if (!tsVal || fl_value_get_type(tsVal) != FL_VALUE_TYPE_INT) {
             continue;
         }
 
-        int currentIndex = index++;
-        int64_t tsUs = std::holds_alternative<int>(tsValue)
-            ? static_cast<int64_t>(std::get<int>(tsValue))
-            : std::get<int64_t>(tsValue);
-        double tsSec = tsUs / 1000000.0;
+        size_t currentIndex = i;
+        double tsSec = static_cast<double>(fl_value_get_int(tsVal)) / 1000.0;
 
         futures.push_back(std::async(std::launch::async, [=, &thumbnails]() {
             std::ostringstream timestampStream;
             timestampStream << std::fixed << std::setprecision(3) << tsSec;
 
-            std::string tempImagePath = GenerateTempFilename("thumb_" + std::to_string(currentIndex), imageExt);
+            std::string tempImagePath = GenerateTempFilename(
+                "thumb_" + std::to_string(currentIndex), imageExt);
 
             std::ostringstream cmd;
             cmd << ffmpegPath
                 << " -ss " << timestampStream.str()
-                << " -i \"" << *inputPath << "\""
+                << " -i \"" << tempVideoPath << "\""
                 << " -vframes 1 -vf scale=" << roundedWidth << ":-2"
                 << " \"" << tempImagePath << "\"";
 
@@ -87,8 +109,9 @@ void HandleGenerateThumbnails(
 
             if (retCode == 0 && fs::exists(tempImagePath)) {
                 std::ifstream in(tempImagePath, std::ios::binary);
-                std::vector<uint8_t> imageBytes((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
-                thumbnails[currentIndex] = flutter::EncodableValue(imageBytes);
+                thumbnails[currentIndex] = std::vector<uint8_t>(
+                    (std::istreambuf_iterator<char>(in)),
+                    std::istreambuf_iterator<char>());
                 std::remove(tempImagePath.c_str());
             }
         }));
@@ -98,7 +121,19 @@ void HandleGenerateThumbnails(
         fut.get();
     }
 
-    result->Success(thumbnails);
+    std::remove(tempVideoPath.c_str());
+
+    g_autoptr(FlValue) result_list = fl_value_new_list();
+    for (size_t i = 0; i < count; i++) {
+        if (!thumbnails[i].empty()) {
+            fl_value_append_take(result_list,
+                fl_value_new_uint8_list(thumbnails[i].data(), thumbnails[i].size()));
+        } else {
+            fl_value_append_take(result_list, fl_value_new_null());
+        }
+    }
+
+    return FL_METHOD_RESPONSE(fl_method_success_response_new(result_list));
 }
 
 } // namespace pro_video_editor

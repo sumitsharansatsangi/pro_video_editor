@@ -6,12 +6,47 @@ void main() {
     final track = VideoAudioTrack(
       path: '/audio/music.mp3',
       volume: 0.8,
+      playbackSpeed: 0.5,
       loop: true,
       audioStartTime: const Duration(seconds: 5),
       audioEndTime: const Duration(seconds: 30),
       startTime: const Duration(seconds: 2),
       endTime: const Duration(seconds: 20),
+      fadeInDuration: const Duration(milliseconds: 500),
+      fadeOutDuration: const Duration(seconds: 1),
     );
+
+    group('playbackSpeed', () {
+      test(
+        'survives JSON and copyWith without moving source trim or fades',
+        () {
+          final restored = VideoAudioTrack.fromJson(track.toJson());
+          expect(restored.playbackSpeed, 0.5);
+          final faster = restored.copyWith(playbackSpeed: 2);
+          expect(faster.playbackSpeed, 2);
+          expect(faster.audioStartTime, const Duration(seconds: 5));
+          expect(faster.audioEndTime, const Duration(seconds: 30));
+          expect(faster.startTime, const Duration(seconds: 2));
+          expect(faster.fadeInDuration, const Duration(milliseconds: 500));
+          expect(faster, isNot(restored));
+          expect(faster.hashCode, isNot(restored.hashCode));
+        },
+      );
+
+      test('old saved tracks default to normal playback', () {
+        final oldMap = track.toMap()..remove('playbackSpeed');
+        expect(VideoAudioTrack.fromMap(oldMap).playbackSpeed, 1);
+      });
+
+      for (final speed in [0.0, -1.0, double.nan, double.infinity]) {
+        test('rejects invalid speed $speed', () {
+          expect(
+            () => VideoAudioTrack(path: '/audio.wav', playbackSpeed: speed),
+            throwsAssertionError,
+          );
+        });
+      }
+    });
 
     group('toMap', () {
       test('serializes all fields correctly', () {
@@ -24,6 +59,8 @@ void main() {
         expect(map['audioEndTime'], 30000000);
         expect(map['startTime'], 2000000);
         expect(map['endTime'], 20000000);
+        expect(map['fadeInDuration'], 500000);
+        expect(map['fadeOutDuration'], 1000000);
       });
 
       test('serializes null durations as null', () {
@@ -49,6 +86,19 @@ void main() {
         expect(restored.audioEndTime, track.audioEndTime);
         expect(restored.startTime, track.startTime);
         expect(restored.endTime, track.endTime);
+        expect(restored.fadeInDuration, track.fadeInDuration);
+        expect(restored.fadeOutDuration, track.fadeOutDuration);
+      });
+
+      test('reads a map written before fades existed as no fade', () {
+        final restored = VideoAudioTrack.fromMap({
+          'path': '/audio.mp3',
+          'volume': 1.0,
+          'loop': false,
+        });
+
+        expect(restored.fadeInDuration, Duration.zero);
+        expect(restored.fadeOutDuration, Duration.zero);
       });
 
       test('handles null durations', () {
@@ -118,6 +168,54 @@ void main() {
       test('different instances are not equal', () {
         final other = track.copyWith(volume: 0.1);
         expect(other, isNot(track));
+      });
+
+      test('a different fade makes the tracks differ', () {
+        expect(track.copyWith(fadeInDuration: Duration.zero), isNot(track));
+        expect(track.copyWith(fadeOutDuration: Duration.zero), isNot(track));
+      });
+    });
+
+    group('equalizer', () {
+      const equalizer = AudioEqualizer(
+        bands: [
+          AudioEqualizerBand(
+            type: AudioEqualizerBandType.lowShelf,
+            frequency: 200,
+            gain: 4,
+          ),
+          AudioEqualizerBand(
+            type: AudioEqualizerBandType.highShelf,
+            frequency: 3000,
+            gain: -2,
+          ),
+        ],
+      );
+
+      test('defaults to none', () {
+        expect(const VideoAudioTrack(path: '/audio.mp3').equalizer, isNull);
+      });
+
+      test('round-trips through toMap and fromMap', () {
+        final withEqualizer = track.copyWith(equalizer: equalizer);
+
+        expect(
+          VideoAudioTrack.fromMap(withEqualizer.toMap()).equalizer,
+          equalizer,
+        );
+      });
+
+      test('a different equalizer makes the tracks differ', () {
+        expect(track.copyWith(equalizer: equalizer), isNot(track));
+      });
+    });
+
+    group('fade', () {
+      test('defaults to none', () {
+        const minimal = VideoAudioTrack(path: '/audio.mp3');
+
+        expect(minimal.fadeInDuration, Duration.zero);
+        expect(minimal.fadeOutDuration, Duration.zero);
       });
     });
 

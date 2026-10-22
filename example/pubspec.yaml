@@ -13,43 +13,48 @@ dependencies:
     path: ../
 
 
-  intl: ^0.20.3
-  cupertino_icons: ^1.0.8
+  intl: ^0.20.1
+  cupertino_icons: ^2.0.0
 
-  pro_image_editor: ^12.4.3
+  pro_image_editor: ^14.15.0
   
   google_fonts: ^8.1.0
-  flutter_colorpicker: ^1.1.0
-  file_picker: ^11.0.2
+  flex_color_picker: ^4.0.0
+  file_picker: 13.1.0
   mime: ^2.0.0
   wav: 1.5.0
 
   path_provider: ^2.1.5
-  video_player: ^2.11.1
-  audioplayers: ^6.6.0
-  # Optional multiplatform video player
-  media_kit: ^1.2.6 # Primary package.
-  media_kit_video: ^2.0.1 # For video rendering.
-  media_kit_libs_video: ^1.0.7 # Native video dependencies.
+  audioplayers: ^6.7.1
+
+  # Video
+  video_player: ^2.14.1
+  fvp: ^0.39.1
+  chewie: ^1.16.0
 
 dev_dependencies:
   integration_test:
     sdk: flutter
   flutter_test:
     sdk: flutter
-  flutter_lints: ^6.0.0
  
-dependency_overrides:
+  flutter_lints: ^6.0.0
+
+dependency_overrides: 
   media_kit:
-    git: "https://github.com/kumsumit/media_kit.git"
+    git: https://github.com/kumsumit/media_kit.git
   media_kit_libs_video:
-    git: "https://github.com/kumsumit/media_kit_libs_video.git"
+    git: https://github.com/kumsumit/media_kit_libs_video.git
   media_kit_video:
-    git: "https://github.com/kumsumit/media_kit_video.git"
+    git: https://github.com/kumsumit/media_kit_video.git
   plugin_platform_interface:
-    git: "https://github.com/kumsumit/plugin_platform_interface.git"
+    git: https://github.com/kumsumit/plugin_platform_interface.git
   file_picker:
-    git: "https://github.com/sumitsharansatsangi/flutter_file_picker"
+    git: https://github.com/sumitsharansatsangi/flutter_file_picker.git
+  path_provider:
+    git: https://github.com/kumsumit/path_provider.git
+
+
 flutter:
   uses-material-design: true
   assets:

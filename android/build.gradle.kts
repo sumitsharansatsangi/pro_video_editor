@@ -1,3 +1,4 @@
+
 import com.android.build.api.dsl.LibraryExtension
 import org.gradle.api.tasks.testing.Test
 
@@ -13,16 +14,20 @@ repositories {
     mavenCentral()
 }
 
-val media3Version = "1.10.1"
+val media3Version = "1.11.1"
+val exifInterfaceVersion = "1.4.2"
+val coroutinesVersion = "1.11.0"
+val junitVersion = "6.1.3"
+val mockitoVersion = "5.24.0"
 
 extensions.configure<LibraryExtension>("android") {
-
     namespace = "ch.waio.pro_video_editor"
 
     compileSdk = 37
 
     defaultConfig {
         minSdk = 24
+        consumerProguardFiles("consumer-rules.pro")
     }
 
     compileOptions {
@@ -31,29 +36,22 @@ extensions.configure<LibraryExtension>("android") {
     }
 
     sourceSets {
-
         getByName("main") {
-            java.setSrcDirs(
-                listOf("src/main/kotlin")
-            )
+            java.srcDir("src/main/kotlin")
         }
 
         getByName("test") {
-            java.setSrcDirs(
-                listOf("src/test/kotlin")
-            )
+            java.srcDir("src/test/kotlin")
         }
     }
 
     testOptions {
+        unitTests.isReturnDefaultValues = true
+
         unitTests.all {
-
-            this as Test
-
             useJUnitPlatform()
 
             testLogging {
-
                 events(
                     "passed",
                     "skipped",
@@ -70,26 +68,34 @@ extensions.configure<LibraryExtension>("android") {
     }
 }
 
-
 dependencies {
+    // Kotlin tests with JUnit 5
+    testImplementation(kotlin("test-junit5"))
 
-    // Kotlin test
-    testImplementation(kotlin("test"))
-
-    // JUnit 5
-    testImplementation("org.junit.jupiter:junit-jupiter-api:5.13.4")
-    testRuntimeOnly("org.junit.jupiter:junit-jupiter-engine:5.13.4")
+    // JUnit Jupiter
+    testImplementation("org.junit.jupiter:junit-jupiter-api:$junitVersion")
+    testRuntimeOnly("org.junit.jupiter:junit-jupiter-engine:$junitVersion")
 
     // Mockito
-    testImplementation("org.mockito:mockito-core:5.23.0")
+    testImplementation("org.mockito:mockito-core:$mockitoVersion")
 
-    // Media3
+    // AndroidX Media3
     implementation("androidx.media3:media3-common:$media3Version")
     implementation("androidx.media3:media3-transformer:$media3Version")
+    implementation("androidx.media3:media3-inspector-frame:$media3Version")
     implementation("androidx.media3:media3-effect:$media3Version")
     implementation("androidx.media3:media3-muxer:$media3Version")
 
-    // Coroutines
-    implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.11.0")
-    implementation("org.jetbrains.kotlinx:kotlinx-coroutines-core:1.11.0")
+    // Image EXIF metadata
+    implementation(
+        "androidx.exifinterface:exifinterface:$exifInterfaceVersion"
+    )
+
+    // Kotlin Coroutines
+    implementation(
+        "org.jetbrains.kotlinx:kotlinx-coroutines-android:$coroutinesVersion"
+    )
+    implementation(
+        "org.jetbrains.kotlinx:kotlinx-coroutines-core:$coroutinesVersion"
+    )
 }

@@ -6,9 +6,14 @@ import 'package:flutter/foundation.dart';
 import 'package:pro_video_editor/shared/models/time_range_mixin.dart';
 import 'package:pro_video_editor/shared/utils/parser/double_parser.dart';
 import 'package:pro_video_editor/shared/utils/parser/int_parser.dart';
+import 'package:pro_video_editor/shared/utils/parser/offset_parser.dart';
 
 import 'editor_layer_image_model.dart';
+import 'keyframe_clock_point_model.dart';
 import 'layer_animation_model.dart';
+import 'layer_audio_visualizer_model.dart';
+import 'layer_censor_model.dart';
+import 'timeline_keyframe_model.dart';
 
 /// A model representing a video overlay layer with timing information.
 class ImageLayer with TimeRangeMixin {
@@ -20,19 +25,80 @@ class ImageLayer with TimeRangeMixin {
     this.endTime,
     this.offset,
     this.size,
+    this.rotation = 0.0,
+    this.loop = true,
+    this.animationOffset = Duration.zero,
     this.animations = const [],
-    this.rotation = 0,
-    this.opacity = 1,
-    this.zIndex = 0,
-    this.anchor,
-    this.blendMode = 'sourceOver',
+    this.animationStartTime,
+    this.animationEndTime,
+    this.censor,
+    this.keyframes = const [],
+    this.keyframeClock = const [],
+    this.audioVisualizer,
   }) : assert(
          startTime == null || endTime == null || startTime < endTime,
          'startTime must be before endTime',
        ),
-       assert(opacity >= 0 && opacity <= 1, 'opacity must be between 0 and 1');
+       assert(
+         animationOffset >= Duration.zero,
+         'animationOffset must not be negative',
+       ),
+       assert(
+         animationStartTime == null ||
+             animationEndTime == null ||
+             animationStartTime < animationEndTime,
+         'animationStartTime must be before animationEndTime',
+       ),
+       assert(
+         keyframes.length == 0 || offset != null,
+         'keyframes place a positioned layer; set [offset]',
+       ),
+       assert(
+         audioVisualizer == null || censor == null,
+         'A layer is either a censor or an audio visualizer',
+       ),
+       assert(
+         audioVisualizer == null || offset == null || size != null,
+         'An audio visualizer fills a box; set [size] with [offset]',
+       );
+
+  /// Creates a layer that draws [visualizer] instead of an image; see
+  /// [LayerAudioVisualizer].
+  ///
+  /// It fills the box [offset] and [size] describe, or the whole frame when
+  /// [offset] is `null`, whatever [size] is.
+  ImageLayer.audioVisualizer({
+    required LayerAudioVisualizer visualizer,
+    Duration? startTime,
+    Duration? endTime,
+    Offset? offset,
+    Size? size,
+    double rotation = 0.0,
+    List<LayerAnimation> animations = const [],
+    Duration? animationStartTime,
+    Duration? animationEndTime,
+    List<TimelineKeyframe> keyframes = const [],
+    List<KeyframeClockPoint> keyframeClock = const [],
+  }) : this(
+         image: EditorLayerImage.memory(_transparentPixelPng),
+         startTime: startTime,
+         endTime: endTime,
+         offset: offset,
+         size: size,
+         rotation: rotation,
+         animations: animations,
+         animationStartTime: animationStartTime,
+         animationEndTime: animationEndTime,
+         keyframes: keyframes,
+         keyframeClock: keyframeClock,
+         audioVisualizer: visualizer,
+       );
 
   /// The image to overlay on the video.
+  ///
+  /// Animated formats (e.g. GIF) are detected automatically and played back
+  /// frame by frame for the time the layer is visible — see [loop]. Static
+  /// images are drawn unchanged.
   final EditorLayerImage image;
 
   @override
@@ -49,9 +115,16 @@ class ImageLayer with TimeRangeMixin {
   /// When `null`, the image is stretched to fill the entire video frame.
   /// When set to a specific value (e.g., [Offset.zero]), the image is
   /// placed at that position at its original size.
+  ///
+  /// When the video segments differ in resolution, the video frame is the one
+  /// they are composited into: the first segment's size, replaced by each
+  /// later segment that is wider or taller. Every segment is scaled to fit
+  /// inside it and the layer is placed from the scaled segment's top-left
+  /// corner, so a layer keeps its place and size on segments of one shape.
   final Offset? offset;
 
-  /// The display size of the image layer, in pixels.
+  /// The display size of the image layer, in pixels of the same frame as
+  /// [offset].
   ///
   /// [Size.width] is the target width of the image.
   /// [Size.height] is the target height of the image.
@@ -60,6 +133,45 @@ class ImageLayer with TimeRangeMixin {
   /// fill the frame when [offset] is also `null`).
   final Size? size;
 
+  /// Clockwise rotation applied to the image layer, in **radians**.
+  ///
+  /// The image is rotated around its own center, so [offset] and [size] still
+  /// describe the unrotated layout box. This matches Flutter's
+  /// [Transform.rotate] convention, which makes it possible to forward a
+  /// `pro_image_editor` layer rotation directly.
+  ///
+  /// **Default**: `0.0` (no rotation).
+  final double rotation;
+
+  /// Whether an animated [image] (e.g. GIF) repeats while the layer is visible.
+  ///
+  /// - `true` (default): the animation loops for the layer's whole time range.
+  /// - `false`: the animation plays once and then holds its last frame until
+  ///   the layer disappears.
+  ///
+  /// Has no effect on static images.
+  final bool loop;
+
+  /// How far into an animated [image] (e.g. GIF) playback begins when the
+  /// layer appears at [startTime].
+  ///
+  /// By default an animated layer starts on its first frame. Set this to
+  /// continue one animation across several layers: a layer that picks up
+  /// where `previous` left off passes
+  ///
+  /// ```dart
+  /// previous.animationOffset +
+  ///     (previous.endTime! - (previous.startTime ?? Duration.zero))
+  /// ```
+  ///
+  /// The offset counts toward [loop], so it wraps around a looping image and
+  /// lands on the last frame of one that does not loop.
+  ///
+  /// Has no effect on static images.
+  ///
+  /// **Default**: [Duration.zero].
+  final Duration animationOffset;
+
   /// Animations to apply to this layer (e.g. fade, slide, scale).
   ///
   /// Multiple animations can be combined. Each animation specifies its
@@ -67,26 +179,71 @@ class ImageLayer with TimeRangeMixin {
   /// and optional [LayerAnimation.curve].
   final List<LayerAnimation> animations;
 
-  /// Clockwise rotation in degrees.
-  final double rotation;
-
-  /// Layer opacity from 0.0 (transparent) to 1.0 (opaque).
-  final double opacity;
-
-  /// Draw order for overlapping layers. Higher values render above lower ones.
-  final int zIndex;
-
-  /// Anchor point within the layer, normalized from 0.0 to 1.0.
+  /// Where the [animations] count from, when that is not [startTime].
   ///
-  /// `Offset(0, 0)` is top-left, `Offset(0.5, 0.5)` is center, and
-  /// `Offset(1, 1)` is bottom-right. When null, positioned layers use center
-  /// anchoring to preserve the original behavior.
-  final Offset? anchor;
-
-  /// Blend mode intent for platforms that support it.
+  /// An [AnimationPhase.animateIn] plays from here and an
+  /// [AnimationPhase.loop] starts its first cycle here; the layer itself still
+  /// shows only from [startTime] to [endTime]. Set it, together with
+  /// [animationEndTime], to keep one set of animations running across several
+  /// layers that each show the content for part of the time, such as the
+  /// steps of a text that types itself out or the words of a karaoke caption
+  /// lighting up one by one: every part carries the same animations and the
+  /// same range, so a fade in carries on over the first parts and a wiggle
+  /// does not restart at each one.
   ///
-  /// Android currently renders image layers with normal source-over blending.
-  final String blendMode;
+  /// **Default**: `null`, which counts from [startTime].
+  final Duration? animationStartTime;
+
+  /// Where the [animations] end, when that is not [endTime]: an
+  /// [AnimationPhase.animateOut] finishes here. See [animationStartTime].
+  ///
+  /// **Default**: `null`, which ends at [endTime].
+  final Duration? animationEndTime;
+
+  /// Blurs or pixelates the picture beneath the layer instead of drawing
+  /// [image], which then only marks the area to hide. See [LayerCensor].
+  ///
+  /// The area takes its place, size, [rotation], time range and [animations]
+  /// from the layer exactly as [image] would be drawn, and a fade animation
+  /// fades the censor in and out.
+  ///
+  /// **Default**: `null`, which draws [image].
+  final LayerCensor? censor;
+
+  /// The layer's placement over time; see [TimelineKeyframe].
+  ///
+  /// When not empty, the keyframes set where the layer is, how big it is, how
+  /// far it is turned and how opaque it is at every point of its time range:
+  /// they replace [offset] and [rotation], scale [size] around its center and
+  /// fade the image. Their times are on the same timeline as [startTime] and
+  /// [endTime], and need not be in order. The [animations] play on top of the
+  /// keyframed placement: a slide starts from the edge nearest to it and a
+  /// bounce lifts by the keyframed height.
+  ///
+  /// A layer with keyframes needs an [offset]; a layer stretched over the
+  /// frame has no placement to move and ignores them.
+  ///
+  /// **Default**: empty, which keeps the layer where [offset] puts it.
+  final List<TimelineKeyframe> keyframes;
+
+  /// The clock [keyframes] are timed on; see [KeyframeClockPoint].
+  ///
+  /// When not empty, every frame is placed by the keyframes at its time on
+  /// this clock instead of at its time on the video, so the keyframes can
+  /// keep the timing they were made on. The [animations] stay on the video's
+  /// timeline.
+  ///
+  /// **Default**: empty, which times [keyframes] on the video's timeline.
+  final List<KeyframeClockPoint> keyframeClock;
+
+  /// Draws bars or a wave that move with the sound instead of [image], which
+  /// is then not read. See [LayerAudioVisualizer].
+  ///
+  /// The visualizer fills the layer's box: [size] at [offset], or the whole
+  /// frame for a stretched layer, one without an [offset].
+  ///
+  /// **Default**: `null`, which draws [image].
+  final LayerAudioVisualizer? audioVisualizer;
 
   ImageLayer copyWith({
     EditorLayerImage? image,
@@ -94,12 +251,16 @@ class ImageLayer with TimeRangeMixin {
     Duration? endTime,
     Offset? offset,
     Size? size,
-    List<LayerAnimation>? animations,
     double? rotation,
-    double? opacity,
-    int? zIndex,
-    Offset? anchor,
-    String? blendMode,
+    bool? loop,
+    Duration? animationOffset,
+    List<LayerAnimation>? animations,
+    Duration? animationStartTime,
+    Duration? animationEndTime,
+    LayerCensor? censor,
+    List<TimelineKeyframe>? keyframes,
+    List<KeyframeClockPoint>? keyframeClock,
+    LayerAudioVisualizer? audioVisualizer,
   }) {
     return ImageLayer(
       image: image ?? this.image,
@@ -107,12 +268,16 @@ class ImageLayer with TimeRangeMixin {
       endTime: endTime ?? this.endTime,
       offset: offset ?? this.offset,
       size: size ?? this.size,
-      animations: animations ?? this.animations,
       rotation: rotation ?? this.rotation,
-      opacity: opacity ?? this.opacity,
-      zIndex: zIndex ?? this.zIndex,
-      anchor: anchor ?? this.anchor,
-      blendMode: blendMode ?? this.blendMode,
+      loop: loop ?? this.loop,
+      animationOffset: animationOffset ?? this.animationOffset,
+      animations: animations ?? this.animations,
+      animationStartTime: animationStartTime ?? this.animationStartTime,
+      animationEndTime: animationEndTime ?? this.animationEndTime,
+      censor: censor ?? this.censor,
+      keyframes: keyframes ?? this.keyframes,
+      keyframeClock: keyframeClock ?? this.keyframeClock,
+      audioVisualizer: audioVisualizer ?? this.audioVisualizer,
     );
   }
 
@@ -125,12 +290,16 @@ class ImageLayer with TimeRangeMixin {
       'size': size != null
           ? {'width': size!.width, 'height': size!.height}
           : null,
-      'animations': animations.map((a) => a.toMap()).toList(),
       'rotation': rotation,
-      'opacity': opacity,
-      'zIndex': zIndex,
-      'anchor': anchor != null ? {'dx': anchor!.dx, 'dy': anchor!.dy} : null,
-      'blendMode': blendMode,
+      'loop': loop,
+      'animationOffset': animationOffset.inMicroseconds,
+      'animations': animations.map((a) => a.toMap()).toList(),
+      'animationStartTime': animationStartTime?.inMicroseconds,
+      'animationEndTime': animationEndTime?.inMicroseconds,
+      'censor': censor?.toMap(),
+      'keyframes': keyframes.map((k) => k.toMap()).toList(),
+      'keyframeClock': keyframeClock.map((p) => p.toMap()).toList(),
+      'audioVisualizer': audioVisualizer?.toMap(),
     };
   }
 
@@ -144,10 +313,7 @@ class ImageLayer with TimeRangeMixin {
           ? Duration(microseconds: safeParseInt(map['endTime']))
           : null,
       offset: map['offset'] != null
-          ? Offset(
-              safeParseDouble((map['offset'] as Map<String, dynamic>)['dx']),
-              safeParseDouble((map['offset'] as Map<String, dynamic>)['dy']),
-            )
+          ? safeParseOffset(map['offset'] as Map<String, dynamic>)
           : null,
       size: map['size'] != null
           ? Size(
@@ -155,21 +321,42 @@ class ImageLayer with TimeRangeMixin {
               safeParseDouble((map['size'] as Map<String, dynamic>)['height']),
             )
           : null,
+      rotation: map['rotation'] != null
+          ? safeParseDouble(map['rotation'])
+          : 0.0,
+      loop: map['loop'] as bool? ?? true,
+      animationOffset: map['animationOffset'] != null
+          ? Duration(microseconds: safeParseInt(map['animationOffset']))
+          : Duration.zero,
       animations:
           (map['animations'] as List<dynamic>?)
               ?.map((a) => LayerAnimation.fromMap(a as Map<String, dynamic>))
               .toList() ??
           const [],
-      rotation: tryParseDouble(map['rotation']) ?? 0,
-      opacity: tryParseDouble(map['opacity']) ?? 1,
-      zIndex: map['zIndex'] != null ? safeParseInt(map['zIndex']) : 0,
-      anchor: map['anchor'] != null
-          ? Offset(
-              safeParseDouble((map['anchor'] as Map<String, dynamic>)['dx']),
-              safeParseDouble((map['anchor'] as Map<String, dynamic>)['dy']),
+      animationStartTime: map['animationStartTime'] != null
+          ? Duration(microseconds: safeParseInt(map['animationStartTime']))
+          : null,
+      animationEndTime: map['animationEndTime'] != null
+          ? Duration(microseconds: safeParseInt(map['animationEndTime']))
+          : null,
+      censor: map['censor'] != null
+          ? LayerCensor.fromMap(map['censor'] as Map<String, dynamic>)
+          : null,
+      keyframes:
+          (map['keyframes'] as List<dynamic>?)
+              ?.map(
+                (k) => TimelineKeyframe.fromMap(
+                  Map<String, dynamic>.from(k as Map),
+                ),
+              )
+              .toList() ??
+          const [],
+      keyframeClock: keyframeClockFromMap(map['keyframeClock']),
+      audioVisualizer: map['audioVisualizer'] != null
+          ? LayerAudioVisualizer.fromMap(
+              Map<String, dynamic>.from(map['audioVisualizer'] as Map),
             )
           : null,
-      blendMode: map['blendMode'] as String? ?? 'sourceOver',
     );
   }
 
@@ -186,12 +373,16 @@ class ImageLayer with TimeRangeMixin {
         'endTime: $endTime, '
         'offset: $offset, '
         'size: $size, '
-        'animations: $animations, '
         'rotation: $rotation, '
-        'opacity: $opacity, '
-        'zIndex: $zIndex, '
-        'anchor: $anchor, '
-        'blendMode: $blendMode'
+        'loop: $loop, '
+        'animationOffset: $animationOffset, '
+        'animations: $animations, '
+        'animationStartTime: $animationStartTime, '
+        'animationEndTime: $animationEndTime, '
+        'censor: $censor, '
+        'keyframes: $keyframes, '
+        'keyframeClock: $keyframeClock, '
+        'audioVisualizer: $audioVisualizer'
         ')';
   }
 
@@ -204,12 +395,16 @@ class ImageLayer with TimeRangeMixin {
         other.endTime == endTime &&
         other.offset == offset &&
         other.size == size &&
-        listEquals(other.animations, animations) &&
         other.rotation == rotation &&
-        other.opacity == opacity &&
-        other.zIndex == zIndex &&
-        other.anchor == anchor &&
-        other.blendMode == blendMode;
+        other.loop == loop &&
+        other.animationOffset == animationOffset &&
+        listEquals(other.animations, animations) &&
+        other.animationStartTime == animationStartTime &&
+        other.animationEndTime == animationEndTime &&
+        other.censor == censor &&
+        listEquals(other.keyframes, keyframes) &&
+        listEquals(other.keyframeClock, keyframeClock) &&
+        other.audioVisualizer == audioVisualizer;
   }
 
   @override
@@ -219,11 +414,24 @@ class ImageLayer with TimeRangeMixin {
         endTime.hashCode ^
         offset.hashCode ^
         size.hashCode ^
-        animations.hashCode ^
         rotation.hashCode ^
-        opacity.hashCode ^
-        zIndex.hashCode ^
-        anchor.hashCode ^
-        blendMode.hashCode;
+        loop.hashCode ^
+        animationOffset.hashCode ^
+        animations.hashCode ^
+        animationStartTime.hashCode ^
+        animationEndTime.hashCode ^
+        censor.hashCode ^
+        Object.hashAll(keyframes) ^
+        Object.hashAll(keyframeClock) ^
+        audioVisualizer.hashCode;
   }
 }
+
+/// A fully transparent 1 x 1 PNG, the image of an
+/// [ImageLayer.audioVisualizer] layer, which no renderer reads.
+final Uint8List _transparentPixelPng = Uint8List.fromList(const [
+  137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13, 73, 72, 68, 82, 0, 0, 0, 1, //
+  0, 0, 0, 1, 8, 6, 0, 0, 0, 31, 21, 196, 137, 0, 0, 0, 11, 73, 68, 65, 84,
+  120, 218, 99, 96, 0, 2, 0, 0, 5, 0, 1, 233, 250, 220, 216, 0, 0, 0, 0, 73,
+  69, 78, 68, 174, 66, 96, 130,
+]);

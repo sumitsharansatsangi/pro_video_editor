@@ -9,10 +9,7 @@ import '/shared/utils/parser/int_parser.dart';
 /// metadata, typically representing where the video was recorded.
 class GpsCoordinates {
   /// Creates a [GpsCoordinates] instance.
-  const GpsCoordinates({
-    required this.latitude,
-    required this.longitude,
-  });
+  const GpsCoordinates({required this.latitude, required this.longitude});
 
   /// The GPS latitude coordinate.
   ///
@@ -79,8 +76,13 @@ class VideoMetadata {
   ///
   /// The [value] map contains metadata values such as duration, resolution,
   /// file size, and others.
-  /// The [extension] is the video file format (e.g., 'mp4').
-  factory VideoMetadata.fromMap(Map<dynamic, dynamic> value, String extension) {
+  /// The [extension] is the video file format (e.g., 'mp4'). An `extension`
+  /// entry in [value] takes precedence; the native side reports one for
+  /// sources whose path carries none, such as Android content URIs.
+  factory VideoMetadata.fromMap(
+    Map<dynamic, dynamic> value,
+    String? extension,
+  ) {
     // All platforms now return display dimensions (after rotation correction)
     final resolution = Size(
       safeParseDouble(value['width']),
@@ -90,7 +92,7 @@ class VideoMetadata {
 
     return VideoMetadata(
       duration: Duration(milliseconds: safeParseInt(value['duration'])),
-      extension: extension,
+      extension: value['extension'] as String? ?? extension ?? 'mp4',
       fileSize: value['fileSize'] ?? 0,
       resolution: resolution,
       rotation: rotation,
@@ -103,8 +105,9 @@ class VideoMetadata {
       author: value['author'] ?? '',
       album: value['album'] ?? '',
       albumArtist: value['albumArtist'] ?? '',
-      date:
-          (value['date'] ?? '') != '' ? DateTime.tryParse(value['date']) : null,
+      date: (value['date'] ?? '') != ''
+          ? DateTime.tryParse(value['date'])
+          : null,
       isOptimizedForStreaming: value['isOptimizedForStreaming'] as bool?,
       gpsCoordinates: value['latitude'] != null && value['longitude'] != null
           ? GpsCoordinates(
@@ -171,13 +174,6 @@ class VideoMetadata {
     final isRotated90Or270 = rotation % 180 != 0;
     return isRotated90Or270 ? resolution.flipped : resolution;
   }
-
-  /// The original resolution of the video before rotation is applied.
-  ///
-  /// @Deprecated: Use [rawResolution] instead. This getter will be removed
-  /// in a future version.
-  @Deprecated('Use rawResolution instead')
-  Size get originalResolution => rawResolution;
 
   /// The rotation of the video.
   final int rotation;
@@ -279,7 +275,6 @@ class VideoMetadata {
     DateTime? date,
     int? fileSize,
     Size? resolution,
-    @Deprecated('No longer supported, has no effect') Size? originalResolution,
     int? rotation,
     Duration? duration,
     Duration? audioDuration,

@@ -397,13 +397,10 @@ class _VideoEditorBasicExamplePageState
 
   Future<VideoClip?> _addClip() async {
     // Open video picker
-    final file = await FilePicker.pickFile(
-      type: FileType.video,
-    );
+    final file = await FilePicker.pickFile(type: FileType.video);
 
     // User cancelled picker
     if (!mounted || file == null) return null;
-
     final path = file.path;
     if (path == null) return null;
 

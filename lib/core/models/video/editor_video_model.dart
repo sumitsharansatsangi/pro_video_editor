@@ -1,10 +1,17 @@
 import 'dart:typed_data';
 
-import 'package:path_provider/path_provider.dart';
+import 'package:flutter/foundation.dart'
+    show TargetPlatform, defaultTargetPlatform, kIsWeb;
 
+import '/core/platform/content_uri_copy.dart';
 import '/core/platform/io/io_helper.dart';
+import '/core/platform/path/path_provider_helper.dart';
 import '/shared/utils/converters.dart';
 import '/shared/utils/file_constructor_utils.dart';
+
+/// Distinguishes temp files written within the same millisecond, so several
+/// sources resolved concurrently cannot collide on one path.
+int _tempFileCounter = 0;
 
 /// A model that encapsulates various ways to load and represent a video.
 ///
@@ -19,8 +26,12 @@ class EditorVideo {
           ? Uint8List.fromList(List<int>.from(map['byteArray'] as List))
           : null,
       file: map['file'] != null ? map['file'] as String : null,
-      networkUrl:
-          map['networkUrl'] != null ? map['networkUrl'] as String : null,
+      networkUrl: map['networkUrl'] != null
+          ? map['networkUrl'] as String
+          : null,
+      contentUrl: map['contentUrl'] != null
+          ? map['contentUrl'] as String
+          : null,
       assetPath: map['assetPath'] != null ? map['assetPath'] as String : null,
     );
   }
@@ -28,26 +39,29 @@ class EditorVideo {
   /// Creates an instance of the `EditorVideo` class with the specified
   /// properties.
   ///
-  /// At least one of `byteArray`, `file`, `networkUrl`, or `assetPath`
-  /// must not be null.
+  /// At least one of `byteArray`, `file`, `networkUrl`, `contentUrl`
+  /// or `assetPath` must not be null.
   EditorVideo._({
     this.byteArray,
     this.networkUrl,
+    this.contentUrl,
     this.assetPath,
     dynamic file,
-  })  : file = file == null ? null : ensureFileInstance(file),
-        assert(
-          byteArray != null ||
-              file != null ||
-              networkUrl != null ||
-              assetPath != null,
-          'At least one of bytes, file, networkUrl, or assetPath must not '
-          'be null.',
-        );
+  }) : file = file == null ? null : ensureFileInstance(file),
+       assert(
+         byteArray != null ||
+             file != null ||
+             networkUrl != null ||
+             contentUrl != null ||
+             assetPath != null,
+         'At least one of bytes, file, networkUrl, assetPath or contentUrl'
+         ' must not be null.',
+       );
 
   /// Creates an [EditorVideo] instance from any supported source.
   ///
-  /// Provide one of [byteArray], [networkUrl], [assetPath], or [file].
+  /// Provide one of [byteArray], [networkUrl], [contentUrl], [assetPath], or
+  /// [file].
   /// Useful for dynamically choosing the video input at runtime.
   ///
   /// Example:
@@ -57,12 +71,14 @@ class EditorVideo {
   factory EditorVideo.autoSource({
     Uint8List? byteArray,
     String? networkUrl,
+    String? contentUrl,
     String? assetPath,
     dynamic file,
   }) {
     return EditorVideo._(
       byteArray: byteArray,
       networkUrl: networkUrl,
+      contentUrl: contentUrl,
       assetPath: assetPath,
       file: file,
     );
@@ -112,6 +128,26 @@ class EditorVideo {
   /// ```
   factory EditorVideo.network(String src) => EditorVideo._(networkUrl: src);
 
+  /// Creates an [EditorVideo] from an Android `content://` URI, such as one
+  /// returned by the photo picker or the Storage Access Framework.
+  ///
+  /// The video is read in place through the `ContentResolver`, so large files
+  /// are not copied. Only a provider that streams the file without random
+  /// access, as some cloud and archive providers do, gets it copied once into
+  /// the cache. Your app must be able to read the URI for as long as the video
+  /// is used, for example by taking a persistable URI permission.
+  ///
+  /// **Android only.** Using it on another platform throws an
+  /// [UnsupportedError].
+  ///
+  /// Example:
+  /// ```dart
+  /// final video = EditorVideo.content(
+  ///   'content://media/picker_get_content/0/com.android.providers.media.photopicker/media/1000032497',
+  /// );
+  /// ```
+  factory EditorVideo.content(String url) => EditorVideo._(contentUrl: url);
+
   /// A byte array representing the video data.
   Uint8List? byteArray;
 
@@ -120,6 +156,9 @@ class EditorVideo {
 
   /// A URL string pointing to an video on the internet.
   final String? networkUrl;
+
+  /// An Android `content://` URI pointing to the video (Android only).
+  final String? contentUrl;
 
   /// A string representing the asset path of an video.
   final String? assetPath;
@@ -130,6 +169,9 @@ class EditorVideo {
   /// Indicates whether the `networkUrl` property is not null.
   bool get hasNetworkUrl => networkUrl != null;
 
+  /// Indicates whether the `contentUrl` property is not null.
+  bool get hasContentUrl => contentUrl != null;
+
   /// Indicates whether the `file` property is not null.
   bool get hasFile => file != null;
 
@@ -138,70 +180,108 @@ class EditorVideo {
 
   /// A future that retrieves the image data as a `Uint8List` from the
   /// appropriate source based on the `EditorVideoType`.
+  ///
+  /// Throws an [UnsupportedError] for an [EditorVideo.content] video, which is
+  /// only read natively on Android.
   Future<Uint8List> safeByteArray() async {
-    Uint8List bytes;
     switch (type) {
       case EditorVideoType.memory:
-        return byteArray!;
+        break;
       case EditorVideoType.asset:
-        bytes = await loadAssetVideoAsUint8List(assetPath!);
-        break;
+        byteArray = await loadAssetVideoAsUint8List(assetPath!);
       case EditorVideoType.file:
-        bytes = await readFileAsUint8List(file!);
-        break;
+        byteArray = await readFileAsUint8List(file!);
       case EditorVideoType.network:
-        bytes = await fetchVideoAsUint8List(networkUrl!);
-        break;
+        byteArray = await fetchVideoAsUint8List(networkUrl!);
+      case EditorVideoType.content:
+        throw UnsupportedError(
+          'A content:// video cannot be read as bytes; it is only supported '
+          'by the native Android implementation.',
+        );
     }
+    return byteArray!;
+  }
 
-    byteArray = bytes;
-
-    return bytes;
+  /// Returns what the native side opens the video from: the [contentUrl] for
+  /// a content video, or else the local path from [safeFilePath].
+  ///
+  /// Throws an [UnsupportedError] for a content video on any platform but
+  /// Android.
+  Future<String> contentOrSafeFilePath() async {
+    if (typePreferredFile != EditorVideoType.content) return safeFilePath();
+    _ensureContentSupported();
+    return contentUrl!;
   }
 
   /// Safely generates a file path for the video and writes the video data to
   /// a file based on the type of the video.
+  ///
+  /// An [EditorVideo.content] video is copied into a temporary file on
+  /// Android, the same way a network video is downloaded; on other platforms
+  /// it throws an [UnsupportedError]. Like a downloaded network video, that
+  /// file is then used for this video from now on, also by the plugin's own
+  /// calls, which otherwise read the URI in place (see
+  /// [contentOrSafeFilePath]).
   Future<String> safeFilePath() async {
-    String filePath = '';
-    File result;
-
-    if (typePreferredFile != EditorVideoType.file) {
-      final directory = await getTemporaryDirectory();
-
-      final now = DateTime.now().millisecondsSinceEpoch;
-      // Preserve original file extension for proper format detection
-      final extension = _getFileExtension();
-      filePath = '${directory.path}/media_$now.$extension';
-    }
-
     switch (typePreferredFile) {
       case EditorVideoType.memory:
-        result = await writeMemoryVideoToFile(byteArray!, filePath);
-        break;
+        file = await writeMemoryVideoToFile(byteArray!, await _tempFilePath());
       case EditorVideoType.asset:
-        result = await writeAssetVideoToFile(assetPath!, filePath);
-        break;
-      case EditorVideoType.file:
-        return file!.path;
+        file = await writeAssetVideoToFile(assetPath!, await _tempFilePath());
       case EditorVideoType.network:
-        result = await fetchVideoToFile(networkUrl!, filePath);
+        file = await fetchVideoToFile(networkUrl!, await _tempFilePath());
+      case EditorVideoType.file:
+        // file is already present
         break;
+      case EditorVideoType.content:
+        _ensureContentSupported();
+        file = File(
+          await copyContentUriToFile(
+            contentUrl!,
+            await _tempFilePath(withExtension: false),
+          ),
+        );
     }
+    return file!.path;
+  }
 
-    file = result;
+  void _ensureContentSupported() {
+    if (kIsWeb || defaultTargetPlatform != TargetPlatform.android) {
+      throw UnsupportedError(
+        'EditorVideo.content (content:// URIs) is only supported on Android.',
+      );
+    }
+  }
 
-    return result.path;
+  /// A new path in the temporary directory. Without [withExtension], the
+  /// native side appends the extension that matches the content.
+  Future<String> _tempFilePath({bool withExtension = true}) async {
+    final directory = await getTemporaryDirectory();
+
+    final now = DateTime.now().millisecondsSinceEpoch;
+    // A per-call counter on top of the timestamp. Several sources are
+    // routinely resolved concurrently (VideoRenderData.toAsyncMap awaits all
+    // of its segments together), and a millisecond is not fine enough to tell
+    // them apart — two of them would pick the same path, write over each
+    // other and end up as one clip.
+    final unique = _tempFileCounter++;
+    final path = '${directory.path}/media_${now}_$unique';
+    if (!withExtension) return path;
+    // Preserve original file extension for proper format detection
+    return '$path.${_getFileExtension()}';
   }
 
   /// Returns the type of the video source.
   ///
   /// This is determined by the first non-null source in the order:
-  /// memory, file, network, asset.
+  /// memory, network, content, asset, file.
   EditorVideoType get type {
     if (hasBytes) {
       return EditorVideoType.memory;
     } else if (hasNetworkUrl) {
       return EditorVideoType.network;
+    } else if (hasContentUrl) {
+      return EditorVideoType.content;
     } else if (hasAssetPath) {
       return EditorVideoType.asset;
     } else {
@@ -215,6 +295,8 @@ class EditorVideo {
       return EditorVideoType.file;
     } else if (hasBytes) {
       return EditorVideoType.memory;
+    } else if (hasContentUrl) {
+      return EditorVideoType.content;
     } else if (hasNetworkUrl) {
       return EditorVideoType.network;
     } else {
@@ -252,12 +334,14 @@ class EditorVideo {
     Uint8List? byteArray,
     File? file,
     String? networkUrl,
+    String? contentUrl,
     String? assetPath,
   }) {
     return EditorVideo.autoSource(
       byteArray: byteArray ?? this.byteArray,
       file: file ?? this.file,
       networkUrl: networkUrl ?? this.networkUrl,
+      contentUrl: contentUrl ?? this.contentUrl,
       assetPath: assetPath ?? this.assetPath,
     );
   }
@@ -271,6 +355,7 @@ class EditorVideo {
         _areUint8ListsEqual(byteArray, other.byteArray) &&
         file?.path == other.file?.path &&
         networkUrl == other.networkUrl &&
+        contentUrl == other.contentUrl &&
         assetPath == other.assetPath;
   }
 
@@ -281,6 +366,7 @@ class EditorVideo {
       file?.path,
       networkUrl,
       assetPath,
+      contentUrl,
     );
   }
 
@@ -304,6 +390,7 @@ class EditorVideo {
       if (byteArray != null) 'byteArray': byteArray!.toList(),
       if (file != null) 'file': file!.path,
       if (networkUrl != null) 'networkUrl': networkUrl,
+      if (contentUrl != null) 'contentUrl': contentUrl,
       if (assetPath != null) 'assetPath': assetPath,
     };
   }
@@ -321,5 +408,8 @@ enum EditorVideoType {
   memory,
 
   /// Represents a video loaded from an asset path.
-  asset
+  asset,
+
+  /// Represents a video loaded from `content://` URL (Android only).
+  content,
 }

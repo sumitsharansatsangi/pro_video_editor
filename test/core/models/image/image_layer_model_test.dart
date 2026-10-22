@@ -4,10 +4,73 @@ import 'dart:ui';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:pro_video_editor/core/models/image/editor_layer_image_model.dart';
 import 'package:pro_video_editor/core/models/image/image_layer_model.dart';
+import 'package:pro_video_editor/core/models/image/keyframe_clock_point_model.dart';
+import 'package:pro_video_editor/core/models/image/layer_audio_visualizer_model.dart';
+import 'package:pro_video_editor/core/models/image/layer_censor_model.dart';
+import 'package:pro_video_editor/core/models/image/timeline_keyframe_model.dart';
 
 void main() {
   group('ImageLayer', () {
     final image = EditorLayerImage.memory(Uint8List.fromList([1, 2, 3]));
+
+    group('keyframes', () {
+      const keyframes = [
+        TimelineKeyframe(time: Duration(seconds: 2), offset: Offset(10, 20)),
+        TimelineKeyframe(
+          time: Duration.zero,
+          offset: Offset(30, 40),
+          scale: 2,
+          opacity: 0.5,
+        ),
+      ];
+
+      test('round-trip through toMap and fromMap', () {
+        final layer = ImageLayer(
+          image: image,
+          offset: const Offset(1, 2),
+          keyframes: keyframes,
+        );
+
+        expect(ImageLayer.fromMap(layer.toMap()).keyframes, keyframes);
+      });
+
+      test('take part in equality and copyWith', () {
+        final layer = ImageLayer(image: image, offset: Offset.zero);
+        final moved = layer.copyWith(keyframes: keyframes);
+
+        expect(moved, isNot(layer));
+        expect(moved.keyframes, keyframes);
+      });
+
+      test('keep their clock through toMap and fromMap', () {
+        const clock = [
+          KeyframeClockPoint(
+            output: Duration(seconds: 1),
+            keyframe: Duration(seconds: 1),
+          ),
+          KeyframeClockPoint(
+            output: Duration(milliseconds: 1500),
+            keyframe: Duration(seconds: 2),
+          ),
+        ];
+        final layer = ImageLayer(
+          image: image,
+          offset: Offset.zero,
+          keyframes: keyframes,
+          keyframeClock: clock,
+        );
+
+        expect(ImageLayer.fromMap(layer.toMap()).keyframeClock, clock);
+        expect(layer, isNot(layer.copyWith(keyframeClock: const [])));
+      });
+
+      test('need a positioned layer', () {
+        expect(
+          () => ImageLayer(image: image, keyframes: keyframes),
+          throwsAssertionError,
+        );
+      });
+    });
 
     group('toMap', () {
       test('serializes all fields correctly', () {
@@ -17,11 +80,8 @@ void main() {
           endTime: const Duration(seconds: 10),
           offset: const Offset(100, 200),
           size: const Size(300, 150),
-          rotation: 45,
-          opacity: 0.6,
-          zIndex: 3,
-          anchor: const Offset(0.25, 0.75),
-          blendMode: 'sourceOver',
+          rotation: 1.5,
+          loop: false,
         );
         final map = layer.toMap();
 
@@ -30,11 +90,17 @@ void main() {
         expect(map['endTime'], 10000000);
         expect(map['offset'], {'dx': 100.0, 'dy': 200.0});
         expect(map['size'], {'width': 300.0, 'height': 150.0});
-        expect(map['rotation'], 45);
-        expect(map['opacity'], 0.6);
-        expect(map['zIndex'], 3);
-        expect(map['anchor'], {'dx': 0.25, 'dy': 0.75});
-        expect(map['blendMode'], 'sourceOver');
+        expect(map['rotation'], 1.5);
+        expect(map['loop'], false);
+      });
+
+      test('serializes animationOffset in microseconds', () {
+        final layer = ImageLayer(
+          image: image,
+          animationOffset: const Duration(milliseconds: 400),
+        );
+
+        expect(layer.toMap()['animationOffset'], 400000);
       });
 
       test('serializes null fields as null', () {
@@ -45,11 +111,9 @@ void main() {
         expect(map['endTime'], isNull);
         expect(map['offset'], isNull);
         expect(map['size'], isNull);
-        expect(map['rotation'], 0);
-        expect(map['opacity'], 1);
-        expect(map['zIndex'], 0);
-        expect(map['anchor'], isNull);
-        expect(map['blendMode'], 'sourceOver');
+        expect(map['rotation'], 0.0);
+        expect(map['loop'], true);
+        expect(map['animationOffset'], 0);
       });
     });
 
@@ -61,11 +125,8 @@ void main() {
           endTime: const Duration(seconds: 10),
           offset: const Offset(100, 200),
           size: const Size(300, 150),
-          rotation: 90,
-          opacity: 0.4,
-          zIndex: 7,
-          anchor: const Offset(1, 1),
-          blendMode: 'sourceOver',
+          rotation: 1.5,
+          loop: false,
         );
         final map = layer.toMap();
         final restored = ImageLayer.fromMap(map);
@@ -74,11 +135,8 @@ void main() {
         expect(restored.endTime, const Duration(seconds: 10));
         expect(restored.offset, const Offset(100, 200));
         expect(restored.size, const Size(300, 150));
-        expect(restored.rotation, 90);
-        expect(restored.opacity, 0.4);
-        expect(restored.zIndex, 7);
-        expect(restored.anchor, const Offset(1, 1));
-        expect(restored.blendMode, 'sourceOver');
+        expect(restored.rotation, 1.5);
+        expect(restored.loop, false);
       });
 
       test('handles null optional fields', () {
@@ -90,6 +148,65 @@ void main() {
         expect(restored.endTime, isNull);
         expect(restored.offset, isNull);
         expect(restored.size, isNull);
+        expect(restored.rotation, 0.0);
+        expect(restored.loop, true);
+      });
+
+      test('restores animationOffset', () {
+        final layer = ImageLayer(
+          image: image,
+          animationOffset: const Duration(milliseconds: 1250),
+        );
+        final restored = ImageLayer.fromMap(layer.toMap());
+
+        expect(restored.animationOffset, const Duration(milliseconds: 1250));
+      });
+
+      test('restores the animation range', () {
+        final layer = ImageLayer(
+          image: image,
+          startTime: const Duration(seconds: 2),
+          endTime: const Duration(seconds: 3),
+          animationStartTime: const Duration(seconds: 1),
+          animationEndTime: const Duration(seconds: 5),
+        );
+        final restored = ImageLayer.fromMap(layer.toMap());
+
+        expect(restored.animationStartTime, const Duration(seconds: 1));
+        expect(restored.animationEndTime, const Duration(seconds: 5));
+      });
+
+      test('leaves the animation range unset when absent from map', () {
+        final restored = ImageLayer.fromMap({'image': image.toMap()});
+
+        expect(restored.animationStartTime, isNull);
+        expect(restored.animationEndTime, isNull);
+      });
+
+      test('defaults animationOffset to zero when absent from map', () {
+        final restored = ImageLayer.fromMap({'image': image.toMap()});
+
+        expect(restored.animationOffset, Duration.zero);
+      });
+
+      test('defaults loop to true when absent from map', () {
+        final restored = ImageLayer.fromMap({'image': image.toMap()});
+
+        expect(restored.loop, true);
+      });
+
+      test('defaults rotation to 0 when absent from map', () {
+        final map = {'image': image.toMap()};
+        final restored = ImageLayer.fromMap(map);
+
+        expect(restored.rotation, 0.0);
+      });
+
+      test('parses numeric string for rotation safely', () {
+        final map = {'image': image.toMap(), 'rotation': '0.75'};
+        final restored = ImageLayer.fromMap(map);
+
+        expect(restored.rotation, 0.75);
       });
 
       test('parses numeric strings safely for offset', () {
@@ -105,6 +222,93 @@ void main() {
         expect(restored.startTime, const Duration(seconds: 3));
         expect(restored.offset, const Offset(50.5, 75.0));
         expect(restored.size, const Size(200.0, 100.0));
+      });
+    });
+
+    group('censor', () {
+      test('is drawn as an image by default', () {
+        final layer = ImageLayer(image: image);
+
+        expect(layer.censor, isNull);
+        expect(layer.toMap()['censor'], isNull);
+        expect(ImageLayer.fromMap(layer.toMap()).censor, isNull);
+      });
+
+      test('roundtrips through toMap / fromMap', () {
+        final layer = ImageLayer(
+          image: image,
+          censor: const LayerCensor.pixelate(blockSize: 24),
+        );
+
+        expect(layer.toMap()['censor'], {'type': 'pixelate', 'strength': 24.0});
+        expect(
+          ImageLayer.fromMap(layer.toMap()).censor,
+          const LayerCensor.pixelate(blockSize: 24),
+        );
+      });
+
+      test('is kept by copyWith and tells layers apart', () {
+        final layer = ImageLayer(
+          image: image,
+          censor: const LayerCensor.blur(sigma: 9),
+        );
+
+        expect(layer.copyWith(loop: false).censor, layer.censor);
+        expect(layer == ImageLayer(image: image), isFalse);
+      });
+    });
+
+    group('audioVisualizer', () {
+      final visualizer = LayerAudioVisualizer(
+        style: AudioVisualizerStyle.wave,
+        bandCount: 2,
+        levels: Float32List.fromList([0.5, 1]),
+      );
+
+      test('draws the image by default', () {
+        final layer = ImageLayer(image: image);
+
+        expect(layer.audioVisualizer, isNull);
+        expect(layer.toMap()['audioVisualizer'], isNull);
+        expect(ImageLayer.fromMap(layer.toMap()).audioVisualizer, isNull);
+      });
+
+      test('roundtrips through toMap / fromMap', () {
+        final layer = ImageLayer.audioVisualizer(
+          visualizer: visualizer,
+          offset: const Offset(10, 20),
+          size: const Size(300, 100),
+        );
+
+        final read = ImageLayer.fromMap(layer.toMap());
+        expect(read.audioVisualizer, visualizer);
+        expect(read.offset, layer.offset);
+        expect(read.size, layer.size);
+      });
+
+      test('the named constructor carries the layer\'s placement', () {
+        final layer = ImageLayer.audioVisualizer(
+          visualizer: visualizer,
+          offset: const Offset(10, 20),
+          size: const Size(300, 100),
+          rotation: 0.5,
+          startTime: const Duration(seconds: 1),
+          endTime: const Duration(seconds: 2),
+        );
+
+        expect(layer.audioVisualizer, visualizer);
+        expect(layer.offset, const Offset(10, 20));
+        expect(layer.size, const Size(300, 100));
+        expect(layer.rotation, 0.5);
+        expect(layer.startTime, const Duration(seconds: 1));
+        expect(layer.endTime, const Duration(seconds: 2));
+      });
+
+      test('is kept by copyWith and tells layers apart', () {
+        final layer = ImageLayer.audioVisualizer(visualizer: visualizer);
+
+        expect(layer.copyWith(loop: false).audioVisualizer, visualizer);
+        expect(layer == ImageLayer(image: layer.image), isFalse);
       });
     });
 
@@ -133,27 +337,62 @@ void main() {
           startTime: const Duration(seconds: 2),
           offset: const Offset(10, 20),
           size: const Size(640, 480),
-          rotation: 12,
-          opacity: 0.5,
-          zIndex: 2,
-          anchor: const Offset(0, 0),
+          rotation: 0.5,
+          loop: false,
         );
 
         expect(copy.startTime, const Duration(seconds: 2));
         expect(copy.offset, const Offset(10, 20));
         expect(copy.size, const Size(640, 480));
-        expect(copy.rotation, 12);
-        expect(copy.opacity, 0.5);
-        expect(copy.zIndex, 2);
-        expect(copy.anchor, const Offset(0, 0));
+        expect(copy.rotation, 0.5);
+        expect(copy.loop, false);
         expect(copy.endTime, isNull);
+      });
+
+      test('keeps original rotation/loop when not overridden', () {
+        final layer = ImageLayer(image: image, rotation: 1.2, loop: false);
+        final copy = layer.copyWith(offset: const Offset(5, 5));
+
+        expect(copy.rotation, 1.2);
+        expect(copy.loop, false);
+      });
+
+      test('overrides and keeps animationOffset', () {
+        final layer = ImageLayer(
+          image: image,
+          animationOffset: const Duration(seconds: 1),
+        );
+
+        final overridden = layer.copyWith(
+          animationOffset: const Duration(seconds: 2),
+        );
+        final kept = layer.copyWith(loop: false);
+
+        expect(overridden.animationOffset, const Duration(seconds: 2));
+        expect(kept.animationOffset, const Duration(seconds: 1));
       });
     });
 
-    test('rejects opacity outside 0..1', () {
+    group('equality', () {
+      test('tells layers apart by animationOffset', () {
+        final a = ImageLayer(image: image);
+        final b = ImageLayer(
+          image: image,
+          animationOffset: const Duration(milliseconds: 1),
+        );
+
+        expect(a == b, isFalse);
+        expect(a, ImageLayer(image: image));
+      });
+    });
+
+    test('rejects a negative animationOffset', () {
       expect(
-        () => ImageLayer(image: image, opacity: 1.1),
-        throwsAssertionError,
+        () => ImageLayer(
+          image: image,
+          animationOffset: const Duration(milliseconds: -1),
+        ),
+        throwsA(isA<AssertionError>()),
       );
     });
 

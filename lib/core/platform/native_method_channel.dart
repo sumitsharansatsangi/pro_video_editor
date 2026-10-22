@@ -4,25 +4,30 @@ import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
 import 'package:mime/mime.dart';
 import 'package:pro_video_editor/core/models/exceptions/audio_exceptions.dart';
-import 'package:pro_video_editor/core/models/exceptions/unsupported_feature_exception.dart';
+import 'package:pro_video_editor/core/models/platform/native_log_entry.dart';
 import 'package:pro_video_editor/core/models/platform/native_log_level.dart';
-import 'package:pro_video_editor/core/models/platform/video_editor_capabilities.dart';
-import 'package:pro_video_editor/core/models/platform/video_editor_feature.dart';
 
 import '/core/models/audio/audio_extract_configs_model.dart';
+import '/core/models/audio/audio_merge_configs_model.dart';
+import '/core/models/audio/audio_merge_result_model.dart';
 import '/core/models/audio/waveform_chunk_model.dart';
 import '/core/models/audio/waveform_configs_model.dart';
 import '/core/models/audio/waveform_data_model.dart';
+import '/core/models/exceptions/native_failure_details.dart';
 import '/core/models/exceptions/render_exceptions.dart';
-import '/core/models/thumbnail/frame_thumbnail_configs_model.dart';
+import '/core/models/frame/luma_frame_configs_model.dart';
+import '/core/models/frame/luma_frame_model.dart';
 import '/core/models/thumbnail/key_frames_configs_model.dart';
 import '/core/models/thumbnail/single_thumbnail_configs_model.dart';
 import '/core/models/thumbnail/thumbnail_base_abstract.dart';
 import '/core/models/thumbnail/thumbnail_configs_model.dart';
+import '/core/models/thumbnail/thumbnail_frame_model.dart';
 import '/core/models/video/editor_video_model.dart';
 import '/core/models/video/progress_model.dart';
+import '/core/models/video/split_video_model.dart';
 import '/core/models/video/video_metadata_model.dart';
 import '/core/platform/io/io_helper.dart';
+import '../models/video/stop_motion_render_data_model.dart';
 import '../models/video/video_render_data_model.dart';
 import 'platform_interface.dart';
 
@@ -46,6 +51,23 @@ class MethodChannelProVideoEditor extends ProVideoEditor {
   /// This is thrown as a [PlatformException] code and converted to
   /// [RenderCanceledException] for cleaner error handling.
   static const String renderCanceledErrorCode = 'CANCELED';
+
+  /// Error code used when the device's video encoder rejected the export
+  /// configuration even after the native fallback chain was exhausted.
+  ///
+  /// This is thrown as a [PlatformException] code and converted to
+  /// [RenderEncoderException] for cleaner error handling.
+  static const String encoderNotSupportedErrorCode = 'ENCODER_NOT_SUPPORTED';
+
+  /// Error code used when a video codec — the encoder, or a decoder the export
+  /// needed for its input — could not be acquired because the device's codec
+  /// resources were exhausted or the session was reclaimed.
+  ///
+  /// Unlike [encoderNotSupportedErrorCode] this is transient: it is thrown as a
+  /// [PlatformException] code and converted to a [RenderEncoderException] with
+  /// `isTransient == true`, which is worth retrying.
+  static const String codecResourceExhaustedErrorCode =
+      'CODEC_RESOURCE_EXHAUSTED';
 
   /// Error code used when a video has no audio track.
   ///
@@ -75,6 +97,98 @@ class MethodChannelProVideoEditor extends ProVideoEditor {
     'pro_video_editor_waveform_stream',
   );
 
+  /// Event channel for receiving thumbnail frames during streaming.
+  ///
+  /// Emits one event per decoded frame for every running
+  /// [getThumbnailStream] task, tagged with the task id.
+  final _thumbnailStreamChannel = const EventChannel(
+    'pro_video_editor_thumbnail_stream',
+  );
+
+  /// The thumbnail event channel's broadcast stream, created once.
+  ///
+  /// Every [getThumbnailStream] call listens to this same stream and filters
+  /// by task id. Calling `receiveBroadcastStream()` per task would give each
+  /// task its own controller, whose first listen and last cancel are sent to
+  /// native as `listen`/`cancel` — so one task finishing would null the native
+  /// sink out from under a task still running. A shared stream reaches native
+  /// only on its first listener and its last cancel.
+  late final Stream<dynamic> _thumbnailEvents = _thumbnailStreamChannel
+      .receiveBroadcastStream();
+
+  /// Event channel for receiving log entries forwarded from native code.
+  ///
+  /// Emits [NativeLogEntry] events whenever the native plugin logs something
+  /// (gated by the active `nativeLogLevel`), allowing host apps to capture
+  /// renderer diagnostics in their own Dart logger.
+  final _logChannel = const EventChannel('pro_video_editor_logs');
+
+  /// Task ids whose start request is being prepared on the Dart side but has
+  /// not yet been dispatched to the native layer (e.g. while
+  /// [VideoRenderData.toAsyncMap] is awaited).
+  ///
+  /// The Dart layer awaits async work before invoking the native render, so a
+  /// quick follow-up [cancel] can run while the task is still in this window.
+  /// Tracking the id here lets that cancel abort the pending start instead of
+  /// launching an un-cancellable native task. Once the task is dispatched the
+  /// id is removed and cancellation is routed to native as usual — so the
+  /// native layer keeps returning `TASK_NOT_FOUND` only for genuinely unknown
+  /// ids.
+  final Set<String> _pendingDispatchTaskIds = <String>{};
+
+  /// Ids from [_pendingDispatchTaskIds] that were cancelled before their native
+  /// task was dispatched. Consumed by [_handoffToNative].
+  final Set<String> _cancelledBeforeDispatchTaskIds = <String>{};
+
+  /// Marks [id] as a task being prepared on the Dart side, before its native
+  /// start request is dispatched. Must be called before the first `await` so a
+  /// concurrent [cancel] can observe it.
+  void _beginDispatch(String id) {
+    if (id.isEmpty) return;
+    _pendingDispatchTaskIds.add(id);
+  }
+
+  /// Hands [id] off to the native layer: from here a [cancel] is routed to the
+  /// native task. Throws [RenderCanceledException] if a [cancel] arrived while
+  /// the task was still being prepared, so the native task is never started.
+  void _handoffToNative(String id) {
+    if (id.isEmpty) return;
+    final wasCancelled = _cancelledBeforeDispatchTaskIds.remove(id);
+    _pendingDispatchTaskIds.remove(id);
+    if (wasCancelled) throw const RenderCanceledException();
+  }
+
+  /// Idempotent cleanup of [id]'s pre-dispatch bookkeeping. Safe to call in a
+  /// `finally` whether the task was dispatched or aborted.
+  void _endDispatch(String id) {
+    if (id.isEmpty) return;
+    _pendingDispatchTaskIds.remove(id);
+    _cancelledBeforeDispatchTaskIds.remove(id);
+  }
+
+  /// Maps an encoder failure reported by native to its typed exception, or
+  /// returns `null` when [error] is not an encoder failure.
+  ///
+  /// The two encoder codes differ only in whether a retry can help, which the
+  /// caller reads from [RenderEncoderException.isTransient]. The platform's
+  /// details are kept, so [RenderEncoderException.codecKind] can tell a
+  /// starved decoder from a starved encoder.
+  RenderEncoderException? _asEncoderException(PlatformException error) {
+    if (error.code == encoderNotSupportedErrorCode) {
+      return RenderEncoderException(
+        error.message,
+        NativeFailureDetails.of(error),
+      );
+    }
+    if (error.code == codecResourceExhaustedErrorCode) {
+      return RenderEncoderException.transient(
+        error.message,
+        NativeFailureDetails.of(error),
+      );
+    }
+    return null;
+  }
+
   @override
   Future<String?> getPlatformVersion() async {
     final version = await methodChannel.invokeMethod<String>(
@@ -84,136 +198,12 @@ class MethodChannelProVideoEditor extends ProVideoEditor {
   }
 
   @override
-  Future<VideoEditorCapabilities> getSupportedFeatures() async {
-    final platform = Platform.operatingSystem;
-
-    if (Platform.isAndroid || Platform.isIOS || Platform.isMacOS) {
-      return VideoEditorCapabilities(
-        platform: platform,
-        supportedFeatures: const {
-          VideoEditorFeature.metadata,
-          VideoEditorFeature.hasAudioTrack,
-          VideoEditorFeature.thumbnails,
-          VideoEditorFeature.keyFrames,
-          VideoEditorFeature.singleThumbnail,
-          VideoEditorFeature.frameThumbnail,
-          VideoEditorFeature.renderVideo,
-          VideoEditorFeature.renderVideoToFile,
-          VideoEditorFeature.cancel,
-          VideoEditorFeature.extractAudio,
-          VideoEditorFeature.extractAudioToFile,
-          VideoEditorFeature.waveform,
-          VideoEditorFeature.waveformStreaming,
-          VideoEditorFeature.rotate,
-          VideoEditorFeature.flip,
-          VideoEditorFeature.crop,
-          VideoEditorFeature.scale,
-          VideoEditorFeature.trim,
-          VideoEditorFeature.mergeVideos,
-          VideoEditorFeature.playbackSpeed,
-          VideoEditorFeature.muteAudio,
-          VideoEditorFeature.imageLayers,
-          VideoEditorFeature.timedImageLayers,
-          VideoEditorFeature.layerAnimations,
-          VideoEditorFeature.colorFilters,
-          VideoEditorFeature.customAudioTracks,
-          VideoEditorFeature.streamingOptimization,
-          VideoEditorFeature.adjustment,
-          VideoEditorFeature.resolutionPresets,
-          VideoEditorFeature.exportQueue,
-          VideoEditorFeature.exportQueuePauseResume,
-          VideoEditorFeature.codecContainerReporting,
-        },
-        experimentalFeatures: const {
-          VideoEditorFeature.blur,
-          VideoEditorFeature.pixelateLayers,
-          VideoEditorFeature.perClipTransforms,
-          VideoEditorFeature.reverseVideo,
-          VideoEditorFeature.transitions,
-          VideoEditorFeature.audioFade,
-          VideoEditorFeature.fpsControl,
-          VideoEditorFeature.codecSelection,
-          VideoEditorFeature.encoderPreference,
-          VideoEditorFeature.vignette,
-          VideoEditorFeature.textLayers,
-          VideoEditorFeature.shapeLayers,
-          VideoEditorFeature.stickerLayers,
-          VideoEditorFeature.pictureInPicture,
-          VideoEditorFeature.backgroundCanvas,
-          VideoEditorFeature.audioCrossfade,
-          VideoEditorFeature.originalAudioTrackSelection,
-          VideoEditorFeature.replaceOriginalAudio,
-          VideoEditorFeature.loudnessNormalization,
-          VideoEditorFeature.audioDucking,
-          VideoEditorFeature.audioPan,
-          VideoEditorFeature.voiceOverRecording,
-          VideoEditorFeature.lut,
-          VideoEditorFeature.grain,
-          VideoEditorFeature.chromaKey,
-          VideoEditorFeature.masks,
-        },
-        supportedVideoCodecs: const {'h264', 'h265', 'vp9', 'av1'},
-        supportedContainers: const {'mp4', 'mov', 'webm', 'gif', 'mp3', 'wav'},
-      );
-    }
-
-    if (Platform.isWindows) {
-      return VideoEditorCapabilities(
-        platform: platform,
-        supportedFeatures: const {
-          VideoEditorFeature.metadata,
-          VideoEditorFeature.resolutionPresets,
-          VideoEditorFeature.exportQueue,
-          VideoEditorFeature.exportQueuePauseResume,
-          VideoEditorFeature.codecContainerReporting,
-        },
-        experimentalFeatures: const {
-          VideoEditorFeature.thumbnails,
-          VideoEditorFeature.keyFrames,
-          VideoEditorFeature.singleThumbnail,
-          VideoEditorFeature.frameThumbnail,
-        },
-        supportedVideoCodecs: const {'h264'},
-        supportedContainers: const {'mp4'},
-      );
-    }
-
-    if (Platform.isLinux) {
-      return VideoEditorCapabilities(
-        platform: platform,
-        supportedFeatures: const {
-          VideoEditorFeature.metadata,
-          VideoEditorFeature.resolutionPresets,
-          VideoEditorFeature.exportQueue,
-          VideoEditorFeature.exportQueuePauseResume,
-          VideoEditorFeature.codecContainerReporting,
-        },
-        experimentalFeatures: const {
-          VideoEditorFeature.thumbnails,
-          VideoEditorFeature.keyFrames,
-          VideoEditorFeature.singleThumbnail,
-          VideoEditorFeature.frameThumbnail,
-        },
-        supportedVideoCodecs: const {'h264', 'vp9'},
-        supportedContainers: const {'mp4', 'webm'},
-      );
-    }
-
-    return VideoEditorCapabilities(
-      platform: platform.isEmpty ? 'unknown' : platform,
-      supportedFeatures: const {},
-    );
-  }
-
-  @override
   Future<VideoMetadata> getMetadata(
     EditorVideo value, {
     bool checkStreamingOptimization = false,
     NativeLogLevel? nativeLogLevel,
   }) async {
-    await _ensureFeatureSupported(VideoEditorFeature.metadata);
-
-    var inputPath = await value.safeFilePath();
+    var inputPath = await value.contentOrSafeFilePath();
 
     var extension = _getFileExtension(inputPath);
 
@@ -234,9 +224,7 @@ class MethodChannelProVideoEditor extends ProVideoEditor {
     EditorVideo value, {
     NativeLogLevel? nativeLogLevel,
   }) async {
-    await _ensureFeatureSupported(VideoEditorFeature.hasAudioTrack);
-
-    var inputPath = await value.safeFilePath();
+    var inputPath = await value.contentOrSafeFilePath();
 
     final result = await methodChannel.invokeMethod<bool>('hasAudioTrack', {
       'inputPath': inputPath,
@@ -251,7 +239,7 @@ class MethodChannelProVideoEditor extends ProVideoEditor {
     ThumbnailBase value, {
     NativeLogLevel? nativeLogLevel,
   }) async {
-    var inputPath = await value.video.safeFilePath();
+    var inputPath = await value.video.contentOrSafeFilePath();
 
     final response = await methodChannel
         .invokeMethod<List<dynamic>>('getThumbnails', {
@@ -270,8 +258,6 @@ class MethodChannelProVideoEditor extends ProVideoEditor {
     ThumbnailConfigs value, {
     NativeLogLevel? nativeLogLevel,
   }) async {
-    await _ensureFeatureSupported(VideoEditorFeature.thumbnails);
-
     return await _extractThumbnails(value, nativeLogLevel: nativeLogLevel);
   }
 
@@ -280,9 +266,150 @@ class MethodChannelProVideoEditor extends ProVideoEditor {
     KeyFramesConfigs value, {
     NativeLogLevel? nativeLogLevel,
   }) async {
-    await _ensureFeatureSupported(VideoEditorFeature.keyFrames);
-
     return await _extractThumbnails(value, nativeLogLevel: nativeLogLevel);
+  }
+
+  @override
+  Stream<ThumbnailFrame> getThumbnailStream(
+    ThumbnailConfigs value, {
+    NativeLogLevel? nativeLogLevel,
+  }) => _nativeFrameStream(
+    id: value.id,
+    video: value.video,
+    method: 'startThumbnailStream',
+    arguments: value.toMap(),
+    errorCode: 'THUMBNAIL_ERROR',
+    parse: ThumbnailFrame.fromMap,
+    nativeLogLevel: nativeLogLevel,
+  );
+
+  @override
+  Stream<LumaFrame> getLumaFrameStream(
+    LumaFrameConfigs value, {
+    NativeLogLevel? nativeLogLevel,
+  }) => _nativeFrameStream(
+    id: value.id,
+    video: value.video,
+    method: 'startFrameStream',
+    arguments: value.toMap(),
+    errorCode: 'FRAME_STREAM_ERROR',
+    parse: LumaFrame.fromMap,
+    nativeLogLevel: nativeLogLevel,
+  );
+
+  /// Runs a native task that emits one event per frame on the shared
+  /// thumbnail event channel, tagged with [id], until a `done` or `error`
+  /// event.
+  ///
+  /// [method] starts the task with [arguments]; [parse] turns each frame
+  /// event into a [T]. A native error without its own code is reported as a
+  /// [PlatformException] with [errorCode].
+  Stream<T> _nativeFrameStream<T>({
+    required String id,
+    required EditorVideo video,
+    required String method,
+    required Map<String, dynamic> arguments,
+    required String errorCode,
+    required T Function(Map<dynamic, dynamic> event) parse,
+    NativeLogLevel? nativeLogLevel,
+  }) {
+    final controller = StreamController<T>();
+    StreamSubscription<dynamic>? subscription;
+    // Set once native reported done/error or the consumer cancelled — from
+    // then on nothing is forwarded.
+    var finished = false;
+
+    void finish() {
+      if (finished) return;
+      finished = true;
+      subscription?.cancel();
+      subscription = null;
+      if (!controller.isClosed) controller.close();
+    }
+
+    void onEvent(dynamic event) {
+      if (finished || event is! Map || event['id'] != id) return;
+      final error = event['error'] as String?;
+      if (error != null) {
+        final code = event['errorCode'] as String?;
+        controller.addError(
+          code == renderCanceledErrorCode
+              ? const RenderCanceledException()
+              : PlatformException(code: code ?? errorCode, message: error),
+        );
+        finish();
+        return;
+      }
+      if (event['done'] == true) {
+        finish();
+        return;
+      }
+      try {
+        controller.add(parse(event));
+      } catch (e, stack) {
+        debugPrint('Error parsing stream frame: $e\n$stack');
+        controller.addError(e, stack);
+      }
+    }
+
+    Future<void> start() async {
+      // Registered before the first await so a cancel that lands while the
+      // path is still resolving aborts the start instead of launching an
+      // un-cancellable native task.
+      _beginDispatch(id);
+      try {
+        final inputPath = await video.contentOrSafeFilePath();
+        _handoffToNative(id);
+        if (finished) return;
+        // Subscribe before starting: native emits the first frame as soon as
+        // it is decoded, which can be before the start call returns.
+        subscription = _thumbnailEvents.listen(
+          onEvent,
+          onError: (Object error, StackTrace stack) {
+            if (finished) return;
+            controller.addError(error, stack);
+            finish();
+          },
+        );
+        // A consumer that leaves while this call is in flight sends its
+        // `cancelTask` on the same channel, so native handles it after the
+        // start and finds the task — no follow-up cancel is needed here.
+        await methodChannel.invokeMethod<void>(method, {
+          'inputPath': inputPath,
+          'extension': _getFileExtension(inputPath),
+          'nativeLogLevel': nativeLogLevel?.methodValue,
+          ...arguments,
+        });
+      } on RenderCanceledException catch (error, stack) {
+        // Cancelled before dispatch. A consumer that left has already closed
+        // the stream; one still listening called [cancel] and is owed the
+        // exception, exactly as it would get it from native.
+        if (!finished) controller.addError(error, stack);
+        finish();
+      } catch (error, stack) {
+        if (finished) return;
+        controller.addError(error, stack);
+        finish();
+      } finally {
+        _endDispatch(id);
+      }
+    }
+
+    controller
+      ..onListen = () {
+        unawaited(start());
+      }
+      ..onCancel = () {
+        // Fires for a consumer cancel and, after close(), for the implicit
+        // cancel of the finished subscription — only the former has a native
+        // task left to stop. Before dispatch [cancel] marks the id so
+        // `_handoffToNative` aborts the start; after it, it stops the task.
+        if (finished) return;
+        finish();
+        unawaited(cancel(id).catchError((_) {}));
+      };
+
+    return controller.stream;
   }
 
   @override
@@ -290,8 +417,6 @@ class MethodChannelProVideoEditor extends ProVideoEditor {
     SingleThumbnailConfigs value, {
     NativeLogLevel? nativeLogLevel,
   }) async {
-    await _ensureFeatureSupported(VideoEditorFeature.singleThumbnail);
-
     final bool isLastFrame = value.position == ThumbnailPosition.last;
     Duration timestamp;
     if (isLastFrame) {
@@ -306,7 +431,7 @@ class MethodChannelProVideoEditor extends ProVideoEditor {
       timestamp = Duration.zero;
     }
 
-    var inputPath = await value.video.safeFilePath();
+    var inputPath = await value.video.contentOrSafeFilePath();
 
     final response = await methodChannel.invokeMethod<List<dynamic>>(
       'getThumbnails',
@@ -320,22 +445,11 @@ class MethodChannelProVideoEditor extends ProVideoEditor {
       },
     );
     final List<Uint8List> result = response?.cast<Uint8List>() ?? [];
-    return result.isNotEmpty ? result.first : null;
-  }
-
-  @override
-  Future<Uint8List?> getFrameThumbnail(
-    FrameThumbnailConfigs value, {
-    NativeLogLevel? nativeLogLevel,
-  }) async {
-    await _ensureFeatureSupported(VideoEditorFeature.frameThumbnail);
-
-    final thumbnails = await _extractThumbnails(
-      value,
-      nativeLogLevel: nativeLogLevel,
-    );
-
-    return thumbnails.isNotEmpty ? thumbnails.first : null;
+    if (result.isEmpty) return null;
+    // A frame that failed or fell out of range comes back as an empty entry;
+    // surface that as "no thumbnail" rather than a zero-byte, broken image.
+    final Uint8List first = result.first;
+    return first.isNotEmpty ? first : null;
   }
 
   @override
@@ -343,10 +457,8 @@ class MethodChannelProVideoEditor extends ProVideoEditor {
     AudioExtractConfigs value, {
     NativeLogLevel? nativeLogLevel,
   }) async {
-    await _ensureFeatureSupported(VideoEditorFeature.extractAudio);
-
     try {
-      var inputPath = await value.video.safeFilePath();
+      var inputPath = await value.video.contentOrSafeFilePath();
 
       final Uint8List? result = await methodChannel
           .invokeMethod<Uint8List>('extractAudio', {
@@ -377,10 +489,8 @@ class MethodChannelProVideoEditor extends ProVideoEditor {
     AudioExtractConfigs value, {
     NativeLogLevel? nativeLogLevel,
   }) async {
-    await _ensureFeatureSupported(VideoEditorFeature.extractAudioToFile);
-
     try {
-      var inputPath = await value.video.safeFilePath();
+      var inputPath = await value.video.contentOrSafeFilePath();
 
       await methodChannel.invokeMethod<String>('extractAudio', {
         'inputPath': inputPath,
@@ -402,14 +512,69 @@ class MethodChannelProVideoEditor extends ProVideoEditor {
   }
 
   @override
+  Future<AudioMergeResult> mergeAudioToFile(
+    String filePath,
+    AudioMergeConfigs configs, {
+    NativeLogLevel? nativeLogLevel,
+  }) async {
+    // Validate before touching native so callers get an ArgumentError rather
+    // than an opaque PlatformException (asserts are stripped in release).
+    if (configs.segments.isEmpty) {
+      throw ArgumentError.value(
+        configs.segments,
+        'segments',
+        'must contain at least one segment',
+      );
+    }
+    for (var i = 0; i < configs.segments.length; i++) {
+      final segment = configs.segments[i];
+      if (segment.endTime <= segment.startTime) {
+        throw ArgumentError(
+          'segment[$i]: endTime (${segment.endTime}) must be after '
+          'startTime (${segment.startTime})',
+        );
+      }
+      if (segment.speed <= 0) {
+        throw ArgumentError(
+          'segment[$i]: speed (${segment.speed}) must be greater than 0',
+        );
+      }
+    }
+
+    try {
+      // Resolve every segment to a local file path, preserving order.
+      final inputPaths = <String>[];
+      for (final segment in configs.segments) {
+        inputPaths.add(await segment.video.contentOrSafeFilePath());
+      }
+
+      final response = await methodChannel
+          .invokeMethod<Map<dynamic, dynamic>>('mergeAudio', {
+            'nativeLogLevel': nativeLogLevel?.methodValue,
+            'outputPath': filePath,
+            ...configs.toMap(inputPaths),
+          });
+
+      if (response == null) {
+        throw ArgumentError('Failed to merge audio');
+      }
+
+      return AudioMergeResult.fromMap(response);
+    } on PlatformException catch (error) {
+      if (error.code == renderCanceledErrorCode) {
+        throw const RenderCanceledException();
+      }
+      rethrow;
+    }
+  }
+
+  @override
   Future<WaveformData> getWaveform(
     WaveformConfigs value, {
     NativeLogLevel? nativeLogLevel,
   }) async {
-    await _ensureFeatureSupported(VideoEditorFeature.waveform);
-
     try {
-      var inputPath = await value.video.safeFilePath();
+      var inputPath = await value.video.contentOrSafeFilePath();
 
       final response = await methodChannel
           .invokeMethod<Map<dynamic, dynamic>>('getWaveform', {
@@ -439,10 +604,8 @@ class MethodChannelProVideoEditor extends ProVideoEditor {
     WaveformConfigs value, {
     NativeLogLevel? nativeLogLevel,
   }) async* {
-    await _ensureFeatureSupported(VideoEditorFeature.waveformStreaming);
-
     // Get the input path before starting the stream
-    final inputPath = await value.video.safeFilePath();
+    final inputPath = await value.video.contentOrSafeFilePath();
     final extension = _getFileExtension(inputPath);
 
     // Start the streaming waveform generation on native side
@@ -530,10 +693,10 @@ class MethodChannelProVideoEditor extends ProVideoEditor {
     VideoRenderData value, {
     NativeLogLevel? nativeLogLevel,
   }) async {
-    await _ensureFeatureSupported(VideoEditorFeature.renderVideo);
-
+    _beginDispatch(value.id);
     try {
       final renderData = await value.toAsyncMap();
+      _handoffToNative(value.id);
 
       final Uint8List? result = await methodChannel.invokeMethod<Uint8List>(
         'renderVideo',
@@ -549,7 +712,11 @@ class MethodChannelProVideoEditor extends ProVideoEditor {
       if (error.code == renderCanceledErrorCode) {
         throw const RenderCanceledException();
       }
+      final encoderError = _asEncoderException(error);
+      if (encoderError != null) throw encoderError;
       rethrow;
+    } finally {
+      _endDispatch(value.id);
     }
   }
 
@@ -559,10 +726,10 @@ class MethodChannelProVideoEditor extends ProVideoEditor {
     VideoRenderData value, {
     NativeLogLevel? nativeLogLevel,
   }) async {
-    await _ensureFeatureSupported(VideoEditorFeature.renderVideoToFile);
-
+    _beginDispatch(value.id);
     try {
       final renderData = await value.toAsyncMap();
+      _handoffToNative(value.id);
 
       await methodChannel.invokeMethod<String>('renderVideo', {
         ...renderData,
@@ -575,7 +742,107 @@ class MethodChannelProVideoEditor extends ProVideoEditor {
       if (error.code == renderCanceledErrorCode) {
         throw const RenderCanceledException();
       }
+      final encoderError = _asEncoderException(error);
+      if (encoderError != null) throw encoderError;
       rethrow;
+    } finally {
+      _endDispatch(value.id);
+    }
+  }
+
+  @override
+  Future<Uint8List> renderStopMotion(
+    StopMotionRenderData value, {
+    NativeLogLevel? nativeLogLevel,
+  }) async {
+    _beginDispatch(value.id);
+    try {
+      final renderData = await value.toAsyncMap();
+      _handoffToNative(value.id);
+
+      final Uint8List? result = await methodChannel.invokeMethod<Uint8List>(
+        'renderStopMotion',
+        {...renderData, 'nativeLogLevel': nativeLogLevel?.methodValue},
+      );
+
+      if (result == null) {
+        throw ArgumentError('Failed to export the stop-motion video');
+      }
+
+      return result;
+    } on PlatformException catch (error) {
+      if (error.code == renderCanceledErrorCode) {
+        throw const RenderCanceledException();
+      }
+      rethrow;
+    } finally {
+      _endDispatch(value.id);
+    }
+  }
+
+  @override
+  Future<String> renderStopMotionToFile(
+    String filePath,
+    StopMotionRenderData value, {
+    NativeLogLevel? nativeLogLevel,
+  }) async {
+    _beginDispatch(value.id);
+    try {
+      final renderData = await value.toAsyncMap();
+      _handoffToNative(value.id);
+
+      await methodChannel.invokeMethod<String>('renderStopMotion', {
+        ...renderData,
+        'outputPath': filePath,
+        'nativeLogLevel': nativeLogLevel?.methodValue,
+      });
+
+      return filePath;
+    } on PlatformException catch (error) {
+      if (error.code == renderCanceledErrorCode) {
+        throw const RenderCanceledException();
+      }
+      rethrow;
+    } finally {
+      _endDispatch(value.id);
+    }
+  }
+
+  @override
+  Future<List<String>> splitVideo(
+    SplitVideoModel value, {
+    NativeLogLevel? nativeLogLevel,
+  }) async {
+    _beginDispatch(value.id);
+    try {
+      final inputPath = await value.video.contentOrSafeFilePath();
+      _handoffToNative(value.id);
+
+      await methodChannel.invokeMethod<void>('splitVideo', {
+        'id': value.id,
+        'inputPath': inputPath,
+        'extension': _getFileExtension(inputPath),
+        'splitUs': value.splitPosition.inMicroseconds,
+        'startOutputPath': value.startOutputPath,
+        'endOutputPath': value.endOutputPath,
+        'outputFormat': value.outputFormat.name,
+        'bitrate': value.effectiveBitrate,
+        'enableAudio': value.enableAudio,
+        'exportTimeoutMs': value.exportTimeout.inMilliseconds,
+        'stallTimeoutMs': value.stallTimeout.inMilliseconds,
+        'nativeLogLevel': nativeLogLevel?.methodValue,
+      });
+
+      return [value.startOutputPath, value.endOutputPath];
+    } on PlatformException catch (error) {
+      if (error.code == renderCanceledErrorCode) {
+        throw const RenderCanceledException();
+      }
+      final encoderError = _asEncoderException(error);
+      if (encoderError != null) throw encoderError;
+      rethrow;
+    } finally {
+      _endDispatch(value.id);
     }
   }
 
@@ -585,7 +852,15 @@ class MethodChannelProVideoEditor extends ProVideoEditor {
       throw ArgumentError('taskId cannot be empty');
     }
 
-    await _ensureFeatureSupported(VideoEditorFeature.cancel);
+    // If the task is still being prepared on the Dart side (its start hasn't
+    // been dispatched to native yet), cancel it locally so the pending start
+    // aborts instead of launching an un-cancellable native task. The native
+    // layer never sees this id, so it keeps reporting TASK_NOT_FOUND only for
+    // genuinely unknown ids.
+    if (_pendingDispatchTaskIds.contains(taskId)) {
+      _cancelledBeforeDispatchTaskIds.add(taskId);
+      return;
+    }
 
     await methodChannel.invokeMethod<void>('cancelTask', {'id': taskId});
   }
@@ -608,6 +883,22 @@ class MethodChannelProVideoEditor extends ProVideoEditor {
           }
         })
         .listen(progressCtrl.add);
+
+    // Subscribe to native log events
+    _logChannel.receiveBroadcastStream().listen(
+      (event) {
+        if (event is! Map) return;
+        try {
+          logCtrl.add(NativeLogEntry.fromMap(event));
+        } catch (e, stack) {
+          // Never let a malformed log entry break the stream.
+          debugPrint('Error parsing native log event: $e\n$stack');
+        }
+      },
+      onError: (Object error, StackTrace stack) {
+        debugPrint('Native log stream error: $error\n$stack');
+      },
+    );
   }
 
   /// Extracts file extension from path using MIME type detection.
@@ -626,15 +917,5 @@ class MethodChannelProVideoEditor extends ProVideoEditor {
     var extension = mimeSp.length == 2 ? mimeSp[1] : 'mp4';
 
     return extension;
-  }
-
-  Future<void> _ensureFeatureSupported(VideoEditorFeature feature) async {
-    final capabilities = await getSupportedFeatures();
-    if (capabilities.supports(feature)) return;
-
-    throw UnsupportedFeatureException(
-      feature: feature,
-      platform: capabilities.platform,
-    );
   }
 }

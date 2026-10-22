@@ -1,12 +1,4581 @@
+import AVFoundation
 import Cocoa
+import CoreGraphics
+import CoreMedia
 import FlutterMacOS
+import ImageIO
 import XCTest
+
+
+@testable import pro_video_editor
+
+// This demonstrates a simple unit test of the Swift portion of this plugin's implementation.
+//
+// See https://developer.apple.com/documentation/xctest for more information about using XCTest.
 
 class RunnerTests: XCTestCase {
 
-  func testExample() {
-    // If you add code to the Runner application, consider adding tests here.
-    // See https://developer.apple.com/documentation/xctest for more information about using XCTest.
+  func testGetPlatformVersion() {
+    let plugin = ProVideoEditorPlugin()
+
+    let call = FlutterMethodCall(methodName: "getPlatformVersion", arguments: [])
+
+    let resultExpectation = expectation(description: "result block must be called.")
+    plugin.handle(call) { result in
+      XCTAssertEqual(result as! String,
+                     "macOS " + ProcessInfo.processInfo.operatingSystemVersionString)
+      resultExpectation.fulfill()
+    }
+    waitForExpectations(timeout: 1)
   }
 
+  // MARK: - Failure details and cancellation
+
+  func testFailureDetailsCarryTheDomainCodeAndUnderlyingChain() {
+    let status = NSError(domain: NSOSStatusErrorDomain, code: -17512)
+    let diskFull = NSError(
+      domain: AVFoundationErrorDomain, code: AVError.diskFull.rawValue,
+      userInfo: [NSUnderlyingErrorKey: status])
+
+    let details = FailureDetails.of(diskFull)
+
+    XCTAssertEqual(details["domain"] as? String, AVFoundationErrorDomain)
+    XCTAssertEqual(details["code"] as? Int, -11807)
+    XCTAssertEqual(
+      details["cause"] as? String,
+      "\(NSOSStatusErrorDomain) -17512: \(status.localizedDescription)")
+  }
+
+  func testFailureDetailsOmitTheCauseWhenThereIsNone() {
+    let details = FailureDetails.of(NSError(domain: "ExportWatchdog", code: 408))
+
+    XCTAssertEqual(details["domain"] as? String, "ExportWatchdog")
+    XCTAssertEqual(details["code"] as? Int, 408)
+    XCTAssertNil(details["cause"])
+  }
+
+  func testFailureDetailsCutTheUnderlyingChainAtTheDepthCap() {
+    var error = NSError(domain: "Test", code: 0)
+    for depth in 1...20 {
+      error = NSError(domain: "Test", code: depth, userInfo: [NSUnderlyingErrorKey: error])
+    }
+
+    let cause = FailureDetails.of(error)["cause"] as? String
+
+    XCTAssertEqual(cause?.components(separatedBy: " <- ").count, 8)
+  }
+
+  // A cancel used to answer before the job it cancelled did: the export
+  // session unwinds asynchronously, and only its completion removed the task,
+  // so a caller that cancelled and immediately started the same id again — a
+  // retry after a stalled export — was refused with TASK_ALREADY_RUNNING.
+  func testCancelledJobAnswersBeforeItsCancelDoesAndFreesItsId() throws {
+    let videoURL = try ThumbnailTimestampFixture.makeColorVideo(
+      colors: Array(ThumbnailTimestampFixture.palette.prefix(3)))
+    defer { try? FileManager.default.removeItem(at: videoURL) }
+    let plugin = ProVideoEditorPlugin()
+    let id = "cancel-then-restart"
+    let render = FlutterMethodCall(
+      methodName: "renderVideo",
+      arguments: [
+        "id": id,
+        "videoClips": [["inputPath": videoURL.path]],
+        "outputFormat": "mp4",
+      ])
+
+    let firstAnswered = expectation(description: "the cancelled render answers exactly once")
+    firstAnswered.assertForOverFulfill = true
+    var firstAnswer: Any?
+    plugin.handle(render) { result in
+      firstAnswer = result
+      firstAnswered.fulfill()
+    }
+
+    // Everything below runs before the main queue gets to drain, so the
+    // pipeline's own unwinding cannot have answered yet: whatever has been
+    // answered here was answered by the cancel itself.
+    var cancelAnswered = false
+    plugin.handle(FlutterMethodCall(methodName: "cancelTask", arguments: ["id": id])) { _ in
+      cancelAnswered = true
+    }
+    XCTAssertTrue(cancelAnswered)
+    XCTAssertEqual((firstAnswer as? FlutterError)?.code, "CANCELED")
+
+    let secondAnswered = expectation(description: "the restarted render answers")
+    var secondAnswer: Any?
+    plugin.handle(render) { result in
+      secondAnswer = result
+      secondAnswered.fulfill()
+    }
+    XCTAssertNotEqual(
+      (secondAnswer as? FlutterError)?.code, "TASK_ALREADY_RUNNING",
+      "the id is free the moment the cancel has answered")
+    plugin.handle(FlutterMethodCall(methodName: "cancelTask", arguments: ["id": id])) { _ in }
+    wait(for: [firstAnswered, secondAnswered], timeout: 5)
+
+    // The first job's own unwinding must not answer its call a second time;
+    // `assertForOverFulfill` above would trip. Give it time to try.
+    let unwound = expectation(description: "the cancelled sessions had time to unwind")
+    unwound.isInverted = true
+    wait(for: [unwound], timeout: 2)
+  }
+
+  // A cancel answers at once, but the pipeline behind the cancelled job is
+  // still unwinding and may yet remove the output it was writing. A job
+  // restarted under the same id must not run into that.
+  func testAJobRestartedUnderACancelledIdWaitsForItsPredecessorToUnwind() {
+    let registry = JobRegistry<FakeJob>()
+    var started: [String] = []
+    let first = FakeJob()
+    registry.start(first, id: "x") { started.append("first") }
+    XCTAssertEqual(started, ["first"])
+
+    XCTAssertTrue(registry.cancel("x") === first)
+    XCTAssertTrue(first.isCanceled)
+    XCTAssertFalse(registry.isRunning("x"), "the cancel frees the id at once")
+
+    let second = FakeJob()
+    registry.start(second, id: "x") { started.append("second") }
+    XCTAssertTrue(registry.isRunning("x"))
+    XCTAssertEqual(started, ["first"], "the restart waits for the cancelled pipeline")
+
+    registry.settle(first, id: "x")
+    XCTAssertEqual(started, ["first", "second"])
+    XCTAssertTrue(registry.isRunning("x"), "the cancelled job's report leaves the restart alone")
+
+    registry.settle(first, id: "x")
+    XCTAssertEqual(started, ["first", "second"], "a duplicate report starts nothing twice")
+
+    registry.settle(second, id: "x")
+    XCTAssertFalse(registry.isRunning("x"))
+  }
+
+  func testAJobCancelledWhileWaitingNeverStartsAndDoesNotBlockTheNext() {
+    let registry = JobRegistry<FakeJob>()
+    var started: [String] = []
+    let first = FakeJob()
+    registry.start(first, id: "x") { started.append("first") }
+    _ = registry.cancel("x")
+
+    let second = FakeJob()
+    registry.start(second, id: "x") { started.append("second") }
+    XCTAssertTrue(registry.cancel("x") === second)
+    XCTAssertTrue(second.isCanceled)
+
+    let third = FakeJob()
+    registry.start(third, id: "x") { started.append("third") }
+    XCTAssertEqual(started, ["first"], "the first job is still unwinding")
+
+    registry.settle(first, id: "x")
+    XCTAssertEqual(started, ["first", "third"], "the cancelled second job never starts")
+  }
+
+  func testCancelAllDropsWhatWasWaiting() {
+    let registry = JobRegistry<FakeJob>()
+    var started: [String] = []
+    let first = FakeJob()
+    registry.start(first, id: "x") { started.append("first") }
+    _ = registry.cancel("x")
+    let second = FakeJob()
+    registry.start(second, id: "x") { started.append("second") }
+
+    registry.cancelAll()
+    XCTAssertTrue(second.isCanceled)
+    registry.settle(first, id: "x")
+    XCTAssertEqual(started, ["first"])
+    XCTAssertFalse(registry.isRunning("x"))
+  }
+
+  // MARK: - Slide animation geometry
+
+  // Frame 1000×500, a small layer (200×100) centered at (400, 200) in
+  // Core Graphics (Y bottom-up) coordinates.
+  private let slideFrame = CGRect(x: 0, y: 0, width: 1000, height: 500)
+  private let slideOverlay = CGRect(x: 400, y: 200, width: 200, height: 100)
+
+  func testSlideMovesLayerFullyOutAtInvPOne() {
+    let left = slideOffset(
+      direction: "left", invP: 1, overlayExtent: slideOverlay, frameExtent: slideFrame)
+    let right = slideOffset(
+      direction: "right", invP: 1, overlayExtent: slideOverlay, frameExtent: slideFrame)
+    let top = slideOffset(
+      direction: "top", invP: 1, overlayExtent: slideOverlay, frameExtent: slideFrame)
+    let bottom = slideOffset(
+      direction: "bottom", invP: 1, overlayExtent: slideOverlay, frameExtent: slideFrame)
+
+    // Edge-aware distance, not the old overlay-size-relative one.
+    XCTAssertEqual(left.x, -600, accuracy: 1e-6)
+    XCTAssertEqual(right.x, 600, accuracy: 1e-6)
+    XCTAssertEqual(top.y, 300, accuracy: 1e-6)
+    XCTAssertEqual(bottom.y, -300, accuracy: 1e-6)
+  }
+
+  func testSlideTrailingEdgeLandsOnFrameEdge() {
+    let left = slideOffset(
+      direction: "left", invP: 1, overlayExtent: slideOverlay, frameExtent: slideFrame)
+    let right = slideOffset(
+      direction: "right", invP: 1, overlayExtent: slideOverlay, frameExtent: slideFrame)
+    let top = slideOffset(
+      direction: "top", invP: 1, overlayExtent: slideOverlay, frameExtent: slideFrame)
+    let bottom = slideOffset(
+      direction: "bottom", invP: 1, overlayExtent: slideOverlay, frameExtent: slideFrame)
+
+    XCTAssertEqual(slideOverlay.maxX + left.x, slideFrame.minX, accuracy: 1e-6)
+    XCTAssertEqual(slideOverlay.minX + right.x, slideFrame.maxX, accuracy: 1e-6)
+    XCTAssertEqual(slideOverlay.minY + top.y, slideFrame.maxY, accuracy: 1e-6)
+    XCTAssertEqual(slideOverlay.maxY + bottom.y, slideFrame.minY, accuracy: 1e-6)
+  }
+
+  func testSlideIsZeroAtRestAndLinearInInvP() {
+    let rest = slideOffset(
+      direction: "left", invP: 0, overlayExtent: slideOverlay, frameExtent: slideFrame)
+    XCTAssertEqual(rest.x, 0, accuracy: 1e-6)
+    XCTAssertEqual(rest.y, 0, accuracy: 1e-6)
+
+    let full = slideOffset(
+      direction: "left", invP: 1, overlayExtent: slideOverlay, frameExtent: slideFrame)
+    let half = slideOffset(
+      direction: "left", invP: 0.5, overlayExtent: slideOverlay, frameExtent: slideFrame)
+    XCTAssertEqual(half.x, full.x / 2, accuracy: 1e-6)
+  }
+
+  func testSlideUnknownDirectionProducesNoOffset() {
+    let off = slideOffset(
+      direction: "diagonal", invP: 1, overlayExtent: slideOverlay, frameExtent: slideFrame)
+    XCTAssertEqual(off.x, 0, accuracy: 1e-6)
+    XCTAssertEqual(off.y, 0, accuracy: 1e-6)
+  }
+
+  // MARK: - Custom slide start point
+
+  func testCustomSlideStartPointTravelsThePixelDelta() {
+    // The layer rests with its top-left at (400, 200) in Flutter coordinates
+    // (Y down); the start point sits 300px left and 150px above it.
+    let off = slideFromOffset(
+      invP: 1, slideFrom: CGPoint(x: 100, y: 50), layerOrigin: CGPoint(x: 400, y: 200))
+
+    XCTAssertEqual(off.x, -300, accuracy: 1e-6)
+    // Core Graphics counts Y upwards, so a smaller Flutter Y moves up.
+    XCTAssertEqual(off.y, 150, accuracy: 1e-6)
+  }
+
+  func testCustomSlideStartPointIsZeroAtRestAndLinearInInvP() {
+    let from = CGPoint(x: 100, y: 50)
+    let origin = CGPoint(x: 400, y: 200)
+
+    let rest = slideFromOffset(invP: 0, slideFrom: from, layerOrigin: origin)
+    XCTAssertEqual(rest.x, 0, accuracy: 1e-6)
+    XCTAssertEqual(rest.y, 0, accuracy: 1e-6)
+
+    let full = slideFromOffset(invP: 1, slideFrom: from, layerOrigin: origin)
+    let half = slideFromOffset(invP: 0.5, slideFrom: from, layerOrigin: origin)
+    XCTAssertEqual(half.x, full.x / 2, accuracy: 1e-6)
+    XCTAssertEqual(half.y, full.y / 2, accuracy: 1e-6)
+  }
+
+  func testCustomSlideStartPointOnTheRestingCornerNeverMoves() {
+    let origin = CGPoint(x: 400, y: 200)
+    let off = slideFromOffset(invP: 1, slideFrom: origin, layerOrigin: origin)
+    XCTAssertEqual(off.x, 0, accuracy: 1e-6)
+    XCTAssertEqual(off.y, 0, accuracy: 1e-6)
+  }
+
+  // MARK: - Loop, wiggle and bounce
+
+  private func animation(
+    _ type: String, _ phase: String, durationUs: Int64 = 1_000_000, curve: String = "linear",
+    wiggleAngle: Double? = nil, bounceHeight: Double? = nil
+  ) -> LayerAnimationConfig {
+    LayerAnimationConfig(
+      type: type, phase: phase, durationUs: durationUs, curve: curve, slideDirection: nil,
+      slideFrom: nil, scaleFrom: nil, wiggleAngle: wiggleAngle, bounceHeight: bounceHeight)
+  }
+
+  private func animatedLayer(
+    _ animations: [LayerAnimationConfig], startUs: Int64 = 0, endUs: Int64 = 10_000_000,
+    animationStartUs: Int64 = -1, animationEndUs: Int64 = -1
+  ) -> ImageLayer {
+    ImageLayer(
+      frames: [CIImage.empty()], frameEndsUs: [0], loop: true, animationOffsetUs: 0,
+      startUs: startUs, endUs: endUs, x: 0, y: 0, width: nil, height: nil, rotation: 0,
+      animations: animations, censor: nil, animationStartUs: animationStartUs,
+      animationEndUs: animationEndUs)
+  }
+
+  private let animatedOverlay = CGRect(x: 0, y: 0, width: 200, height: 100)
+  private let animatedFrame = CGRect(x: 0, y: 0, width: 1000, height: 500)
+
+  func testLoopRunsFromRestToFullyAwayAndBackOncePerCycle() {
+    let loop = animation("scale", "loop")
+    func value(_ t: Int64) -> Double {
+      animationProgress(loop, currentTimeUs: t, startUs: 0, endUs: -1)!.value
+    }
+    XCTAssertEqual(value(0), 1, accuracy: 1e-9)
+    XCTAssertEqual(value(250_000), 0.5, accuracy: 1e-9)
+    XCTAssertEqual(value(500_000), 0, accuracy: 1e-9)
+    XCTAssertEqual(value(750_000), 0.5, accuracy: 1e-9)
+    XCTAssertEqual(value(7_000_000), 1, accuracy: 1e-9)
+    XCTAssertEqual(value(7_500_000), 0, accuracy: 1e-9)
+  }
+
+  func testLoopPlaysOnlyWithinItsWindowCountingFromItsStart() {
+    var loop = animation("fade", "loop")
+    loop.loopStartUs = 3_000_000
+    loop.loopEndUs = 5_000_000
+    func progress(_ t: Int64) -> AnimationProgress? {
+      animationProgress(loop, currentTimeUs: t, startUs: 0, endUs: -1)
+    }
+    XCTAssertNil(progress(2_999_999))
+    XCTAssertEqual(progress(3_000_000)!.value, 1, accuracy: 1e-9)
+    // Cycles count from the window, not from the layer's start.
+    XCTAssertEqual(progress(3_500_000)!.value, 0, accuracy: 1e-9)
+    XCTAssertEqual(progress(4_500_000)!.value, 0, accuracy: 1e-9)
+    XCTAssertNil(progress(5_000_000))
+  }
+
+  func testLoopStartsAtItsPhaseAndRunsOnFromThere() {
+    // A quarter cycle in at its start: half way out already.
+    var loop = animation("fade", "loop")
+    loop.loopStartUs = 3_000_000
+    loop.loopEndUs = 5_000_000
+    loop.loopPhaseUs = 250_000
+    func value(_ t: Int64) -> Double {
+      animationProgress(loop, currentTimeUs: t, startUs: 0, endUs: -1)!.value
+    }
+    XCTAssertEqual(value(3_000_000), 0.5, accuracy: 1e-9)
+    XCTAssertEqual(value(3_250_000), 0, accuracy: 1e-9)
+    XCTAssertEqual(value(3_750_000), 1, accuracy: 1e-9)
+    // A phase below zero lands inside the cycle, not past rest.
+    loop.loopPhaseUs = -750_000
+    XCTAssertEqual(value(3_000_000), 0.5, accuracy: 1e-9)
+  }
+
+  func testLoopCurveShapesTheWayOutLikeAnOutAnimation() {
+    // easeIn: x², with x = 1 at rest. A quarter cycle has x = 0.5.
+    let loop = animation("fade", "loop", curve: "easeIn")
+    let progress = animationProgress(loop, currentTimeUs: 250_000, startUs: 0, endUs: -1)!
+    XCTAssertEqual(progress.value, 0.25, accuracy: 1e-9)
+  }
+
+  func testWiggleLoopSwingsToOneSideAndThenTheOther() {
+    let wiggle = animation("wiggle", "loop")
+    let first = animationProgress(wiggle, currentTimeUs: 250_000, startUs: 0, endUs: -1)!
+    let second = animationProgress(wiggle, currentTimeUs: 750_000, startUs: 0, endUs: -1)!
+    XCTAssertEqual(first.value, 0, accuracy: 1e-9)
+    XCTAssertEqual(first.swing, 1)
+    XCTAssertEqual(second.value, 0, accuracy: 1e-9)
+    XCTAssertEqual(second.swing, -1)
+  }
+
+  func testWiggleTiltsClockwiseAroundTheOverlayCenter() {
+    let layer = animatedLayer([animation("wiggle", "loop", wiggleAngle: .pi / 2)])
+    let (_, transform, _) = computeAnimation(
+      layer: layer, currentTimeUs: 250_000, overlayExtent: animatedOverlay,
+      frameExtent: animatedFrame)
+
+    // Clockwise on screen: the right edge's middle swings down, which is
+    // towards smaller Y in Core Graphics. The center stays put.
+    let rightEdge = CGPoint(x: 200, y: 50).applying(transform)
+    XCTAssertEqual(rightEdge.x, 100, accuracy: 1e-9)
+    XCTAssertEqual(rightEdge.y, -50, accuracy: 1e-9)
+    let center = CGPoint(x: 100, y: 50).applying(transform)
+    XCTAssertEqual(center.x, 100, accuracy: 1e-9)
+    XCTAssertEqual(center.y, 50, accuracy: 1e-9)
+  }
+
+  func testBounceLiftsByAMultipleOfTheOverlayHeight() {
+    let layer = animatedLayer([animation("bounce", "animateIn", bounceHeight: 1.5)])
+    func lift(_ t: Int64) -> CGFloat {
+      computeAnimation(
+        layer: layer, currentTimeUs: t, overlayExtent: animatedOverlay,
+        frameExtent: animatedFrame
+      ).transform.ty
+    }
+    XCTAssertEqual(lift(0), 150, accuracy: 1e-9)
+    XCTAssertEqual(lift(500_000), 75, accuracy: 1e-9)
+    XCTAssertEqual(lift(1_000_000), 0, accuracy: 1e-9)
+  }
+
+  func testScaleAndSlideComposeTheSameInEitherOrder() {
+    // Half way in: half size and half way back from the left edge. The scale
+    // grows the overlay around its center whatever the list order, so the
+    // slide is not shrunk with it, as on Android.
+    let scale = LayerAnimationConfig(
+      type: "scale", phase: "animateIn", durationUs: 1_000_000, curve: "linear",
+      slideDirection: nil, slideFrom: nil, scaleFrom: 0)
+    let slide = LayerAnimationConfig(
+      type: "slide", phase: "animateIn", durationUs: 1_000_000, curve: "linear",
+      slideDirection: "left", slideFrom: nil, scaleFrom: nil)
+    for animations in [[scale, slide], [slide, scale]] {
+      let transform = computeAnimation(
+        layer: animatedLayer(animations), currentTimeUs: 500_000,
+        overlayExtent: animatedOverlay, frameExtent: animatedFrame
+      ).transform
+      let center = CGPoint(x: 100, y: 50).applying(transform)
+      XCTAssertEqual(center.x, 0, accuracy: 1e-9)
+      XCTAssertEqual(center.y, 50, accuracy: 1e-9)
+      let rightEdge = CGPoint(x: 200, y: 50).applying(transform)
+      XCTAssertEqual(rightEdge.x, 50, accuracy: 1e-9)
+    }
+  }
+
+  func testUntiltedPlacementLeavesOutOnlyTheWiggle() {
+    // A quarter into the wiggle cycle it is tilted 90° clockwise; the bounce
+    // still lifts by three quarters of the overlay's height.
+    let layer = animatedLayer([
+      animation("wiggle", "loop", wiggleAngle: .pi / 2),
+      animation("bounce", "animateIn", bounceHeight: 1),
+    ])
+    let (_, transform, untilted) = computeAnimation(
+      layer: layer, currentTimeUs: 250_000, overlayExtent: animatedOverlay,
+      frameExtent: animatedFrame)
+
+    let tilted = CGPoint(x: 200, y: 50).applying(transform)
+    XCTAssertEqual(tilted.x, 100, accuracy: 1e-9)
+    XCTAssertEqual(tilted.y, 25, accuracy: 1e-9)
+    let upright = CGPoint(x: 200, y: 50).applying(untilted)
+    XCTAssertEqual(upright.x, 200, accuracy: 1e-9)
+    XCTAssertEqual(upright.y, 125, accuracy: 1e-9)
+  }
+
+  func testTextRevealsLeaveTheImageAsItIs() {
+    let layer = animatedLayer([
+      animation("typewriter", "animateIn"), animation("wordByWord", "animateOut"),
+    ])
+    let (opacity, transform, _) = computeAnimation(
+      layer: layer, currentTimeUs: 0, overlayExtent: animatedOverlay,
+      frameExtent: animatedFrame)
+    XCTAssertEqual(opacity, 1)
+    XCTAssertTrue(transform.isIdentity)
+  }
+
+  func testAnimationsCountFromTheirOwnRange() {
+    // One part of a layer split over time: it shows from 0.5 s, but its fade
+    // in started with the whole layer at 0 and is halfway there.
+    let layer = animatedLayer(
+      [animation("fade", "animateIn")], startUs: 500_000, endUs: 700_000,
+      animationStartUs: 0, animationEndUs: 2_000_000)
+    let (opacity, _, _) = computeAnimation(
+      layer: layer, currentTimeUs: 500_000, overlayExtent: animatedOverlay,
+      frameExtent: animatedFrame)
+    XCTAssertEqual(opacity, 0.5, accuracy: 1e-9)
+  }
+
+  // MARK: - Animated layer frame lookup
+
+  // Four frames of 500 ms each: one playthrough lasts 2 s.
+  private let gifFrameEndsUs: [Int64] = [500_000, 1_000_000, 1_500_000, 2_000_000]
+
+  private func gifFrame(
+    at timeUs: Int64, startUs: Int64 = 1_000_000, offsetUs: Int64 = 0, loop: Bool = true
+  ) -> Int {
+    animatedFrameIndex(
+      atUs: timeUs, startUs: startUs, animationOffsetUs: offsetUs,
+      frameEndsUs: gifFrameEndsUs, loop: loop)
+  }
+
+  func testAnimatedLayerWithoutAnOffsetOpensOnItsFirstFrame() {
+    XCTAssertEqual(gifFrame(at: 1_000_000), 0)
+    XCTAssertEqual(gifFrame(at: 1_250_000), 0)
+    XCTAssertEqual(gifFrame(at: 1_750_000), 1)
+  }
+
+  func testAnimationOffsetStartsPlaybackThatFarIn() {
+    XCTAssertEqual(gifFrame(at: 1_000_000, offsetUs: 1_000_000), 2)
+    XCTAssertEqual(gifFrame(at: 1_750_000, offsetUs: 1_000_000), 3)
+  }
+
+  func testALayerPickingUpWhereAnotherLeftOffContinuesItsAnimation() {
+    let times = stride(from: Int64(0), to: 3_000_000, by: 40_000)
+    let single = times.map { gifFrame(at: $0, startUs: 0) }
+    let split = times.map {
+      $0 < 1_000_000
+        ? gifFrame(at: $0, startUs: 0)
+        : gifFrame(at: $0, startUs: 1_000_000, offsetUs: 1_000_000)
+    }
+    XCTAssertEqual(single, split)
+  }
+
+  func testAnimationOffsetWrapsAroundALoopingAnimation() {
+    XCTAssertEqual(gifFrame(at: 1_250_000, offsetUs: 2_500_000), 1)
+    XCTAssertEqual(gifFrame(at: 1_000_000, offsetUs: 4_000_000), 0)
+  }
+
+  func testAnimationOffsetPastTheEndHoldsTheLastFrameWithoutLooping() {
+    XCTAssertEqual(gifFrame(at: 1_000_000, offsetUs: 5_000_000, loop: false), 3)
+    XCTAssertEqual(gifFrame(at: 1_000_000, offsetUs: 1_000_000, loop: false), 2)
+  }
+
+  func testAnimatedLayerBeforeItAppearsShowsTheFrameItOpensOn() {
+    XCTAssertEqual(gifFrame(at: 0, offsetUs: 1_000_000), 2)
+  }
+
+  func testAnimatedLayerFromTheStartOfTheVideoCountsFromZero() {
+    XCTAssertEqual(gifFrame(at: 250_000, startUs: -1, offsetUs: 500_000), 1)
+  }
+
+  // Int64.max µs lands 775_807 µs into a 2 s playthrough. Adding it to the
+  // elapsed time unreduced traps on overflow and takes the app down.
+  func testHugeAnimationOffsetDoesNotOverflow() {
+    XCTAssertEqual(gifFrame(at: 1_250_000, offsetUs: .max), 2)
+    XCTAssertEqual(gifFrame(at: 3_000_000, offsetUs: .max, loop: false), 3)
+  }
+
+  func testNegativeAnimationOffsetIsTreatedAsNone() {
+    XCTAssertEqual(gifFrame(at: 1_250_000, offsetUs: -700_000), 0)
+  }
+
+  func testStaticLayerAlwaysShowsItsOnlyFrame() {
+    XCTAssertEqual(
+      animatedFrameIndex(
+        atUs: 5_000_000, startUs: 0, animationOffsetUs: 1_000_000, frameEndsUs: [0], loop: true),
+      0)
+  }
+
+  // MARK: - Engine-detach result delivery
+
+  // Before detach a captured FlutterResult delivers normally.
+  func testDeliverResultInvokesClosureBeforeDetach() {
+    let plugin = ProVideoEditorPlugin()
+
+    var deliveredCount = 0
+    var deliveredValue: Any?
+    plugin.deliverResult({ value in
+      deliveredCount += 1
+      deliveredValue = value
+    }, "payload")
+
+    XCTAssertEqual(deliveredCount, 1)
+    XCTAssertEqual(deliveredValue as? String, "payload")
+  }
+
+  // Regression guard for the `else`-after-detach hole: once the engine has been
+  // torn down, a late async delivery must be a terminal no-op so it never
+  // messages a no-longer-running FlutterEngine.
+  func testDeliverResultIsNoOpAfterDetach() {
+    let plugin = ProVideoEditorPlugin()
+
+    plugin.tearDownForEngineDetach()
+
+    var deliveredCount = 0
+    plugin.deliverResult({ _ in
+      deliveredCount += 1
+    }, "payload")
+
+    XCTAssertEqual(deliveredCount, 0)
+  }
+
+  // MARK: - Thumbnail timestamp alignment (concurrent-callback regression)
+
+  // A synthetic video is authored with one distinct solid color per second.
+  // Thumbnails are then requested for many timestamps, in shuffled order, and
+  // every returned frame must decode to the color of the second it was
+  // requested for. This exercises the path where
+  // `generateCGImagesAsynchronously(forTimes:)` (and the ordered async
+  // sequence) delivers callbacks concurrently / out of order — the regression
+  // that previously mapped frames to the wrong timestamps or never completed.
+  //
+  // The result must (a) always arrive (no hang), (b) equal the requested count,
+  // and (c) map index-for-index to the requested timestamps with no reordering,
+  // dropped, or duplicated frames — verified across a stress loop.
+  func testThumbnailsAlignToRequestedTimestampsUnderConcurrency() throws {
+    let palette = ThumbnailTimestampFixture.palette
+    let videoURL = try ThumbnailTimestampFixture.makeColorVideo(colors: palette)
+    defer { try? FileManager.default.removeItem(at: videoURL) }
+
+    // Three sub-second offsets per color band, well away from band edges so the
+    // decoded frame is unambiguously inside a single color.
+    var entries: [(us: Int64, colorIndex: Int)] = []
+    for second in 0..<palette.count {
+      for frac in [0.3, 0.5, 0.7] {
+        let seconds = Double(second) + frac
+        entries.append((Int64((seconds * 1_000_000).rounded()), second))
+      }
+    }
+
+    let iterations = 12
+    for iteration in 0..<iterations {
+      // Shuffle so the requested order differs from the natural order; the
+      // returned array must still line up with the request positions.
+      let shuffled = entries.shuffled()
+      let timestampsUs = shuffled.map { $0.us }
+      let expectedColorIndex = shuffled.map { $0.colorIndex }
+
+      let config = ThumbnailConfig(
+        id: "concurrency-\(iteration)",
+        inputPath: videoURL.path,
+        fileExtension: "mp4",
+        boxFit: "contain",
+        outputFormat: "png",
+        jpegQuality: 100,
+        outputWidth: 80,
+        outputHeight: 45,
+        timestampsUs: timestampsUs,
+        maxOutputFrames: nil,
+        lastFrameTolerance: false
+      )
+
+      let completed = expectation(description: "onComplete fires (iteration \(iteration))")
+      completed.assertForOverFulfill = true
+      var received: [Data]?
+      var receivedError: Error?
+
+      ThumbnailGenerator.getThumbnails(
+        config: config,
+        onProgress: { _ in },
+        onComplete: { data in
+          received = data
+          completed.fulfill()
+        },
+        onError: { error in
+          receivedError = error
+          completed.fulfill()
+        }
+      )
+
+      // A timeout here is the guard against the wedge: a lost completion count
+      // used to leave the continuation unresumed forever.
+      wait(for: [completed], timeout: 30)
+
+      XCTAssertNil(receivedError, "iteration \(iteration): unexpected error")
+      guard let result = received else {
+        XCTFail("iteration \(iteration): no result delivered")
+        return
+      }
+
+      XCTAssertEqual(
+        result.count, timestampsUs.count,
+        "iteration \(iteration): result count must equal requested count")
+
+      for i in 0..<min(result.count, expectedColorIndex.count) {
+        XCTAssertFalse(
+          result[i].isEmpty,
+          "iteration \(iteration): frame \(i) is unexpectedly empty")
+
+        guard let color = ThumbnailTimestampFixture.decodedColor(result[i]) else {
+          XCTFail("iteration \(iteration): frame \(i) could not be decoded")
+          continue
+        }
+
+        let classified = ThumbnailTimestampFixture.nearestPaletteIndex(color, palette: palette)
+        XCTAssertEqual(
+          classified, expectedColorIndex[i],
+          "iteration \(iteration): frame \(i) (t=\(timestampsUs[i])us) decoded to "
+            + "color band \(classified) but timestamp belongs to band \(expectedColorIndex[i])")
+      }
+    }
+  }
+
+  // A single failed/out-of-range frame must not drop the others or shift them:
+  // the result stays index-aligned, the bad slot is an empty `Data()`, and the
+  // call still completes.
+  func testThumbnailsRepresentFailedFramePositionally() throws {
+    let palette = ThumbnailTimestampFixture.palette
+    let videoURL = try ThumbnailTimestampFixture.makeColorVideo(colors: palette)
+    defer { try? FileManager.default.removeItem(at: videoURL) }
+
+    // Middle timestamp is far past the end of the video, so that frame fails
+    // while the surrounding ones succeed.
+    let good0 = Int64(0.5 * 1_000_000)
+    let bad = Int64(9_999 * 1_000_000)
+    let good1 = Int64(1.5 * 1_000_000)
+    let timestampsUs = [good0, bad, good1]
+
+    let config = ThumbnailConfig(
+      id: "positional",
+      inputPath: videoURL.path,
+      fileExtension: "mp4",
+      boxFit: "contain",
+      outputFormat: "png",
+      jpegQuality: 100,
+      outputWidth: 80,
+      outputHeight: 45,
+      timestampsUs: timestampsUs,
+      maxOutputFrames: nil,
+      lastFrameTolerance: false
+    )
+
+    let completed = expectation(description: "onComplete fires")
+    var received: [Data]?
+    ThumbnailGenerator.getThumbnails(
+      config: config,
+      onProgress: { _ in },
+      onComplete: { data in
+        received = data
+        completed.fulfill()
+      },
+      onError: { _ in }
+    )
+    wait(for: [completed], timeout: 30)
+
+    guard let result = received else {
+      XCTFail("no result delivered")
+      return
+    }
+
+    XCTAssertEqual(result.count, 3, "result must stay the length of the request")
+    XCTAssertFalse(result[0].isEmpty, "first frame should succeed")
+    XCTAssertFalse(result[2].isEmpty, "third frame should succeed")
+
+    if let c0 = ThumbnailTimestampFixture.decodedColor(result[0]) {
+      XCTAssertEqual(
+        ThumbnailTimestampFixture.nearestPaletteIndex(c0, palette: palette), 0)
+    } else {
+      XCTFail("could not decode frame 0")
+    }
+    if let c2 = ThumbnailTimestampFixture.decodedColor(result[2]) {
+      XCTAssertEqual(
+        ThumbnailTimestampFixture.nearestPaletteIndex(c2, palette: palette), 1)
+    } else {
+      XCTFail("could not decode frame 2")
+    }
+  }
+
+  // Drives the legacy `generateCGImagesAsynchronously` path (lock +
+  // requestedTime→index resolution) directly. Modern OS versions route
+  // production through the ordered async sequence, so this is the only coverage
+  // for the concurrent-callback code — the exact code the wedge lived in.
+  func testConcurrentPathAlignsFramesToTimestamps() throws {
+    let palette = ThumbnailTimestampFixture.palette
+    let videoURL = try ThumbnailTimestampFixture.makeColorVideo(colors: palette)
+    defer { try? FileManager.default.removeItem(at: videoURL) }
+
+    var entries: [(us: Int64, colorIndex: Int)] = []
+    for second in 0..<palette.count {
+      for frac in [0.3, 0.5, 0.7] {
+        let seconds = Double(second) + frac
+        entries.append((Int64((seconds * 1_000_000).rounded()), second))
+      }
+    }
+
+    for iteration in 0..<8 {
+      let shuffled = entries.shuffled()
+      let timestampsUs = shuffled.map { $0.us }
+      let expectedColorIndex = shuffled.map { $0.colorIndex }
+
+      let config = ThumbnailConfig(
+        id: "concurrent-\(iteration)",
+        inputPath: videoURL.path,
+        fileExtension: "mp4",
+        boxFit: "contain",
+        outputFormat: "png",
+        jpegQuality: 100,
+        outputWidth: 80,
+        outputHeight: 45,
+        timestampsUs: timestampsUs,
+        maxOutputFrames: nil,
+        lastFrameTolerance: false
+      )
+
+      let generator = AVAssetImageGenerator(asset: AVURLAsset(url: videoURL))
+      generator.appliesPreferredTrackTransform = true
+      generator.requestedTimeToleranceBefore = .zero
+      generator.requestedTimeToleranceAfter = .zero
+
+      let times = timestampsUs.map {
+        NSValue(time: CMTime(value: $0, timescale: 1_000_000))
+      }
+
+      let done = expectation(description: "concurrent path completes (iteration \(iteration))")
+      Task {
+        let result = await ThumbnailGenerator.generateThumbnailDataConcurrent(
+          generator: generator,
+          times: times,
+          config: config,
+          onProgress: { _ in }
+        )
+
+        XCTAssertEqual(
+          result.count, timestampsUs.count,
+          "iteration \(iteration): concurrent path result count")
+
+        for i in 0..<min(result.count, expectedColorIndex.count) {
+          XCTAssertFalse(
+            result[i].isEmpty,
+            "iteration \(iteration): concurrent frame \(i) is empty")
+          if let color = ThumbnailTimestampFixture.decodedColor(result[i]) {
+            XCTAssertEqual(
+              ThumbnailTimestampFixture.nearestPaletteIndex(color, palette: palette),
+              expectedColorIndex[i],
+              "iteration \(iteration): concurrent frame \(i) misaligned")
+          } else {
+            XCTFail("iteration \(iteration): concurrent frame \(i) could not decode")
+          }
+        }
+        done.fulfill()
+      }
+
+      // Times out (fails) rather than hanging forever if the continuation is
+      // never resumed — the original wedge.
+      wait(for: [done], timeout: 30)
+    }
+  }
+
+  // The streaming path hands every frame to `onFrame` from the concurrent
+  // completion handlers. Each one must be delivered before the call returns —
+  // the caller reports `done` right after — and in the order the completion
+  // counter assigns, so progress never runs backwards.
+  func testConcurrentPathDeliversEveryFrameInCounterOrderBeforeReturning() throws {
+    let palette = ThumbnailTimestampFixture.palette
+    let videoURL = try ThumbnailTimestampFixture.makeColorVideo(colors: palette)
+    defer { try? FileManager.default.removeItem(at: videoURL) }
+
+    let timestampsUs: [Int64] = (0..<palette.count).flatMap { second in
+      [0.3, 0.5, 0.7].map { Int64(((Double(second) + $0) * 1_000_000).rounded()) }
+    }
+    let config = ThumbnailConfig(
+      id: "concurrent-stream",
+      inputPath: videoURL.path,
+      fileExtension: "mp4",
+      boxFit: "contain",
+      outputFormat: "png",
+      jpegQuality: 100,
+      outputWidth: 80,
+      outputHeight: 45,
+      timestampsUs: timestampsUs,
+      maxOutputFrames: nil,
+      lastFrameTolerance: false
+    )
+    let times = timestampsUs.map {
+      NSValue(time: CMTime(value: $0, timescale: 1_000_000))
+    }
+
+    for iteration in 0..<8 {
+      let generator = AVAssetImageGenerator(asset: AVURLAsset(url: videoURL))
+      generator.appliesPreferredTrackTransform = true
+      generator.requestedTimeToleranceBefore = .zero
+      generator.requestedTimeToleranceAfter = .zero
+
+      let lock = NSLock()
+      var delivered: [(indices: [Int], progress: Double)] = []
+      let done = expectation(description: "concurrent stream completes (iteration \(iteration))")
+      Task {
+        _ = await ThumbnailGenerator.generateThumbnailDataConcurrent(
+          generator: generator,
+          times: times,
+          config: config,
+          onProgress: { _ in },
+          onFrame: { indices, data, progress in
+            XCTAssertNotNil(data, "iteration \(iteration): frame \(indices) failed")
+            lock.lock()
+            delivered.append((indices, progress))
+            lock.unlock()
+          }
+        )
+        // Snapshot under the lock: a handler still delivering after the
+        // return is exactly the bug this guards against.
+        lock.lock()
+        let snapshot = delivered
+        lock.unlock()
+
+        XCTAssertEqual(
+          snapshot.flatMap { $0.indices }.sorted(), Array(timestampsUs.indices),
+          "iteration \(iteration): every frame is delivered before the call returns")
+        for (earlier, later) in zip(snapshot, snapshot.dropFirst()) {
+          XCTAssertLessThanOrEqual(
+            earlier.progress, later.progress,
+            "iteration \(iteration): progress ran backwards")
+        }
+        XCTAssertEqual(
+          snapshot.last?.progress, 1.0,
+          "iteration \(iteration): the last delivered frame carries 1.0")
+        done.fulfill()
+      }
+
+      wait(for: [done], timeout: 30)
+    }
+  }
+
+}
+
+// MARK: - Thumbnail timestamp test fixtures
+
+/// Helpers for authoring a color-coded test video and reading colors back out
+/// of generated thumbnails. Shared by the iOS and macOS RunnerTests.
+enum ThumbnailTimestampFixture {
+
+  typealias RGB = (r: UInt8, g: UInt8, b: UInt8)
+
+  /// Eight solid colors, each pair separated by a large RGB distance so a
+  /// nearest-color classification survives the RGB→YUV→RGB round trip of H.264
+  /// without ever misclassifying which band a frame came from.
+  static let palette: [RGB] = [
+    (215, 40, 40),
+    (40, 215, 40),
+    (40, 40, 215),
+    (215, 215, 40),
+    (215, 40, 215),
+    (40, 215, 215),
+    (215, 215, 215),
+    (40, 40, 40),
+  ]
+
+  /// Authors an H.264 `.mp4` where second `i` is entirely `colors[i]`.
+  ///
+  /// `codec` and `colorProperties` let a test author the HEVC + BT.2020 shape
+  /// the render pipeline pre-transcodes; the pixels stay 8-bit either way.
+  /// `timescale` sets the media timescale; phone recordings use a fine one
+  /// such as 90 000, which lets a time range start between two frame
+  /// boundaries instead of snapping to one. One that is no multiple of `fps`
+  /// rounds every frame to its nearest tick, as a remux onto a 1000 timescale
+  /// does: 60 fps then lasts 17, 16, 17 ms.
+  static func makeColorVideo(
+    colors: [RGB],
+    fps: Int32 = 30,
+    size: CGSize = CGSize(width: 160, height: 90),
+    codec: AVVideoCodecType = .h264,
+    colorProperties: [String: Any]? = nil,
+    timescale: CMTimeScale? = nil
+  ) throws -> URL {
+    let url = FileManager.default.temporaryDirectory
+      .appendingPathComponent("pve_thumb_\(UUID().uuidString).mp4")
+
+    let writer = try AVAssetWriter(outputURL: url, fileType: .mp4)
+    var settings: [String: Any] = [
+      AVVideoCodecKey: codec,
+      AVVideoWidthKey: Int(size.width),
+      AVVideoHeightKey: Int(size.height),
+    ]
+    if let colorProperties {
+      settings[AVVideoColorPropertiesKey] = colorProperties
+    }
+    let input = AVAssetWriterInput(mediaType: .video, outputSettings: settings)
+    input.expectsMediaDataInRealTime = false
+    if let timescale { input.mediaTimeScale = timescale }
+    let scale = timescale ?? fps
+
+    let adaptor = AVAssetWriterInputPixelBufferAdaptor(
+      assetWriterInput: input,
+      sourcePixelBufferAttributes: [
+        kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA,
+        kCVPixelBufferWidthKey as String: Int(size.width),
+        kCVPixelBufferHeightKey as String: Int(size.height),
+      ]
+    )
+
+    guard writer.canAdd(input) else {
+      throw NSError(domain: "ThumbnailTimestampFixture", code: 1)
+    }
+    writer.add(input)
+    writer.startWriting()
+    writer.startSession(atSourceTime: .zero)
+
+    let framesPerColor = Int(fps)
+    var frameIndex = 0
+    for color in colors {
+      let buffer = try makePixelBuffer(color: color, size: size)
+      for _ in 0..<framesPerColor {
+        while !input.isReadyForMoreMediaData {
+          usleep(500)
+        }
+        let pts = CMTime(
+          value: (CMTimeValue(frameIndex) * CMTimeValue(scale) + CMTimeValue(fps / 2))
+            / CMTimeValue(fps),
+          timescale: scale)
+        adaptor.append(buffer, withPresentationTime: pts)
+        frameIndex += 1
+      }
+    }
+
+    input.markAsFinished()
+    let finished = DispatchSemaphore(value: 0)
+    writer.finishWriting { finished.signal() }
+    finished.wait()
+
+    guard writer.status == .completed else {
+      throw writer.error
+        ?? NSError(domain: "ThumbnailTimestampFixture", code: 2)
+    }
+    return url
+  }
+
+  private static func makePixelBuffer(color: RGB, size: CGSize) throws -> CVPixelBuffer {
+    var pixelBuffer: CVPixelBuffer?
+    let status = CVPixelBufferCreate(
+      kCFAllocatorDefault,
+      Int(size.width),
+      Int(size.height),
+      kCVPixelFormatType_32BGRA,
+      [
+        kCVPixelBufferCGImageCompatibilityKey as String: true,
+        kCVPixelBufferCGBitmapContextCompatibilityKey as String: true,
+      ] as CFDictionary,
+      &pixelBuffer
+    )
+    guard status == kCVReturnSuccess, let buffer = pixelBuffer else {
+      throw NSError(domain: "ThumbnailTimestampFixture", code: 3)
+    }
+
+    CVPixelBufferLockBaseAddress(buffer, [])
+    defer { CVPixelBufferUnlockBaseAddress(buffer, []) }
+
+    guard
+      let context = CGContext(
+        data: CVPixelBufferGetBaseAddress(buffer),
+        width: Int(size.width),
+        height: Int(size.height),
+        bitsPerComponent: 8,
+        bytesPerRow: CVPixelBufferGetBytesPerRow(buffer),
+        space: CGColorSpaceCreateDeviceRGB(),
+        bitmapInfo: CGImageAlphaInfo.premultipliedFirst.rawValue
+          | CGBitmapInfo.byteOrder32Little.rawValue
+      )
+    else {
+      throw NSError(domain: "ThumbnailTimestampFixture", code: 4)
+    }
+
+    // Logical RGB fill; CoreGraphics writes the correct BGRA bytes.
+    context.setFillColor(
+      red: CGFloat(color.r) / 255,
+      green: CGFloat(color.g) / 255,
+      blue: CGFloat(color.b) / 255,
+      alpha: 1
+    )
+    context.fill(CGRect(x: 0, y: 0, width: size.width, height: size.height))
+
+    return buffer
+  }
+
+  /// Decodes encoded image `data` and returns its average color (the frames are
+  /// solid, so the average is the frame's color).
+  static func decodedColor(_ data: Data) -> RGB? {
+    guard
+      let source = CGImageSourceCreateWithData(data as CFData, nil),
+      let image = CGImageSourceCreateImageAtIndex(source, 0, nil)
+    else { return nil }
+    return averageColor(of: image)
+  }
+
+  /// The average color of `image`, by drawing it into a single pixel.
+  static func averageColor(of image: CGImage) -> RGB? {
+    var pixel = [UInt8](repeating: 0, count: 4)
+    guard
+      let context = CGContext(
+        data: &pixel,
+        width: 1,
+        height: 1,
+        bitsPerComponent: 8,
+        bytesPerRow: 4,
+        space: CGColorSpaceCreateDeviceRGB(),
+        bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+      )
+    else { return nil }
+
+    context.interpolationQuality = .high
+    context.draw(image, in: CGRect(x: 0, y: 0, width: 1, height: 1))
+    return (pixel[0], pixel[1], pixel[2])
+  }
+
+  /// Returns the index of the palette color closest to `color`.
+  static func nearestPaletteIndex(_ color: RGB, palette: [RGB]) -> Int {
+    var bestIndex = 0
+    var bestDistance = Int.max
+    for (index, candidate) in palette.enumerated() {
+      let dr = Int(color.r) - Int(candidate.r)
+      let dg = Int(color.g) - Int(candidate.g)
+      let db = Int(color.b) - Int(candidate.b)
+      let distance = dr * dr + dg * dg + db * db
+      if distance < bestDistance {
+        bestDistance = distance
+        bestIndex = index
+      }
+    }
+    return bestIndex
+  }
+}
+
+// MARK: - Concurrent renders
+
+/// Two renders in flight at once must each composite with their own effects.
+///
+/// The compositor used to read its configuration off a type-level static that
+/// every render wrote during setup, so the render whose `setVideoComposition:`
+/// ran last won — the others composited with its overlays and color filters —
+/// and the unsynchronized writes over-released the previous value's arrays,
+/// which surfaced as an `EXC_BAD_ACCESS` under `destroy for
+/// VideoCompositorConfig` in the field.
+final class ConcurrentRenderTests: XCTestCase {
+
+  /// One color filter per palette entry, each a channel permutation that maps
+  /// the solid red source (R high, G and B low) onto that entry, so every
+  /// render expects a color no other render produces. Rows R, G, B, A; each
+  /// output channel copies the input channel its `1` sits on.
+  private static let filters: [(matrix: [Double], paletteIndex: Int)] = [
+    ([1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 1, 0], 0),  // red
+    ([0, 1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 1, 0], 1),  // green
+    ([0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 1, 0], 2),  // blue
+    ([1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 1, 0], 3),  // yellow
+    ([1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 1, 0], 4),  // magenta
+    ([0, 1, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 1, 0], 5),  // cyan
+    ([1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 1, 0], 6),  // white
+    ([0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 1, 0], 7),  // dark
+  ]
+
+  func testConcurrentRendersEachCompositeWithTheirOwnEffects() throws {
+    let palette = ThumbnailTimestampFixture.palette
+    let source = try ThumbnailTimestampFixture.makeColorVideo(
+      colors: [palette[0], palette[0]])
+    defer { try? FileManager.default.removeItem(at: source) }
+
+    // Enough renders that their setups overlap regardless of scheduling; the
+    // encodes themselves are serialized by `ExportGate`, the setup is not.
+    let renders = Self.filters.count
+    var outputs: [URL] = []
+    defer {
+      for output in outputs { try? FileManager.default.removeItem(at: output) }
+    }
+    var expectations: [XCTestExpectation] = []
+    var errors: [Int: Error] = [:]
+    let errorsLock = NSLock()
+
+    for index in 0..<renders {
+      let output = FileManager.default.temporaryDirectory
+        .appendingPathComponent("pve_concurrent_\(UUID().uuidString).mp4")
+      outputs.append(output)
+      let filter = Self.filters[index]
+      let config = try XCTUnwrap(
+        RenderConfig.fromArguments([
+          "videoClips": [["inputPath": source.path]],
+          "outputPath": output.path,
+          "outputFormat": "mp4",
+          "enableAudio": false,
+          "colorFilters": [["matrix": filter.matrix.map { NSNumber(value: $0) }]],
+        ]))
+
+      let finished = expectation(description: "render \(index) settles")
+      finished.assertForOverFulfill = true
+      expectations.append(finished)
+      RenderVideo.render(
+        config: config,
+        onProgress: { _ in },
+        onComplete: { _ in finished.fulfill() },
+        onError: { error in
+          errorsLock.lock()
+          errors[index] = error
+          errorsLock.unlock()
+          finished.fulfill()
+        })
+    }
+    wait(for: expectations, timeout: 180)
+
+    XCTAssertTrue(errors.isEmpty, "renders failed: \(errors)")
+    for (index, output) in outputs.enumerated() {
+      let expected = Self.filters[index].paletteIndex
+      let color = try XCTUnwrap(Self.frameColor(of: output), "render \(index) has no frame")
+      let classified = ThumbnailTimestampFixture.nearestPaletteIndex(color, palette: palette)
+      XCTAssertEqual(
+        classified, expected,
+        "render \(index) composited with another render's color filter "
+          + "(got \(color), expected palette[\(expected)])")
+    }
+  }
+
+  /// The average color of the frame half a second into `url`.
+  private static func frameColor(of url: URL) -> ThumbnailTimestampFixture.RGB? {
+    let generator = AVAssetImageGenerator(asset: AVURLAsset(url: url))
+    generator.requestedTimeToleranceBefore = .zero
+    generator.requestedTimeToleranceAfter = CMTime(value: 1, timescale: 10)
+    guard
+      let image = try? generator.copyCGImage(
+        at: CMTime(value: 1, timescale: 2), actualTime: nil)
+    else { return nil }
+    return ThumbnailTimestampFixture.averageColor(of: image)
+  }
+}
+
+// MARK: - Setup-stage gate and watchdog (#201)
+
+/// The HDR pre-transcode and the overlap-transition pre-render are hardware
+/// encodes that run before the job reaches its main encode. Until #201 they ran
+/// outside `ExportGate` and `ExportWatchdog`, so a session that stalled there
+/// never returned and the job hung for good. These drive real
+/// `AVAssetExportSession`s under a stall bound too tight for any encode to beat
+/// — the driver reports progress every 200 ms, so a 1 ms bound fires before the
+/// first report — and assert the job fails with the watchdog's error instead of
+/// hanging, degrading, or holding the gate.
+final class SetupStageWatchdogTests: XCTestCase {
+
+  /// The production bound, restored after every test; the tests tighten it to
+  /// a value no encode can beat.
+  private let defaultStallTimeout = RenderVideo.renderStallTimeout
+
+  override func tearDown() {
+    SetupStageExport.stallTimeout = defaultStallTimeout
+    super.tearDown()
+  }
+
+  private static func isWatchdogError(_ error: Error?) -> Bool {
+    guard let error else { return false }
+    return (error as NSError).domain == ExportWatchdog.errorDomain
+  }
+
+  /// Runs `config` to completion and returns the error it failed with, if any.
+  ///
+  /// Awaited rather than blocked on: a `wait(for:)` from an `async` test pins
+  /// the cooperative-pool thread the render's own task may need.
+  private func render(_ config: RenderConfig, timeout: TimeInterval) async -> Error? {
+    let settled = expectation(description: "render settles")
+    var failure: Error?
+    RenderVideo.render(
+      config: config,
+      onProgress: { _ in },
+      onComplete: { _ in settled.fulfill() },
+      onError: { error in
+        failure = error
+        settled.fulfill()
+      })
+    await fulfillment(of: [settled], timeout: timeout)
+    return failure
+  }
+
+  /// Fails instead of hanging when `body` never returns — the shape of a
+  /// leaked gate slot, which would otherwise stall the whole test run.
+  private func withTimeout(
+    _ seconds: TimeInterval, _ body: @escaping () async throws -> Void
+  ) async throws {
+    try await withThrowingTaskGroup(of: Void.self) { group in
+      group.addTask { try await body() }
+      group.addTask {
+        try await Task.sleep(nanoseconds: UInt64(seconds * 1_000_000_000))
+        throw NSError(
+          domain: "SetupStageWatchdogTests", code: 1,
+          userInfo: [NSLocalizedDescriptionKey: "nothing returned within \(seconds)s"])
+      }
+      try await group.next()
+      group.cancelAll()
+    }
+  }
+
+  func testAStalledSetupStageEncodeFailsWithinTheBoundAndFreesTheGate() async throws {
+    let palette = ThumbnailTimestampFixture.palette
+    let source = try ThumbnailTimestampFixture.makeColorVideo(colors: [palette[0], palette[0]])
+    defer { try? FileManager.default.removeItem(at: source) }
+    let stalledOutput = FileManager.default.temporaryDirectory
+      .appendingPathComponent("pve_stage_stalled_\(UUID().uuidString).mp4")
+    let laterOutput = FileManager.default.temporaryDirectory
+      .appendingPathComponent("pve_stage_later_\(UUID().uuidString).mp4")
+    defer {
+      try? FileManager.default.removeItem(at: stalledOutput)
+      try? FileManager.default.removeItem(at: laterOutput)
+    }
+    let diagnostics = TranscodeExportDiagnostics(input: source.lastPathComponent)
+
+    SetupStageExport.stallTimeout = 0.001
+    let stalled = try XCTUnwrap(
+      AVAssetExportSession(
+        asset: AVURLAsset(url: source), presetName: AVAssetExportPresetPassthrough))
+    let started = Date()
+    var failure: Error?
+    do {
+      try await SetupStageExport.run(
+        stalled, to: stalledOutput, as: .mp4, diagnostics: diagnostics,
+        label: "Test", failureDomain: "Test")
+      XCTFail("a stalled encode must not complete")
+    } catch {
+      failure = error
+    }
+    XCTAssertTrue(
+      Self.isWatchdogError(failure),
+      "expected the watchdog's error, got \(String(describing: failure))")
+    XCTAssertLessThan(
+      Date().timeIntervalSince(started), 10,
+      "the stall bound is 1 ms; anything near the 20 s default means the bound was not applied")
+
+    // The slot is released on the way out: an encode under the real bound
+    // runs — it does not sit queued behind the stalled one.
+    SetupStageExport.stallTimeout = defaultStallTimeout
+    let later = try XCTUnwrap(
+      AVAssetExportSession(
+        asset: AVURLAsset(url: source), presetName: AVAssetExportPresetPassthrough))
+    try await withTimeout(30) {
+      try await SetupStageExport.run(
+        later, to: laterOutput, as: .mp4, diagnostics: diagnostics,
+        label: "Test", failureDomain: "Test")
+    }
+    XCTAssertTrue(FileManager.default.fileExists(atPath: laterOutput.path))
+  }
+
+  func testAStalledTransitionPreRenderFailsTheRenderInsteadOfCuttingHard() async throws {
+    let palette = ThumbnailTimestampFixture.palette
+    let outgoing = try ThumbnailTimestampFixture.makeColorVideo(colors: [palette[0], palette[0]])
+    let incoming = try ThumbnailTimestampFixture.makeColorVideo(colors: [palette[1], palette[1]])
+    let output = FileManager.default.temporaryDirectory
+      .appendingPathComponent("pve_stage_transition_\(UUID().uuidString).mp4")
+    defer {
+      try? FileManager.default.removeItem(at: outgoing)
+      try? FileManager.default.removeItem(at: incoming)
+      try? FileManager.default.removeItem(at: output)
+    }
+    let config = try XCTUnwrap(
+      RenderConfig.fromArguments([
+        "videoClips": [
+          [
+            "inputPath": outgoing.path,
+            "transition": ["type": "dissolve", "durationUs": NSNumber(value: 500_000)],
+          ],
+          ["inputPath": incoming.path],
+        ],
+        "outputPath": output.path,
+        "outputFormat": "mp4",
+        "enableAudio": false,
+      ]))
+
+    SetupStageExport.stallTimeout = 0.001
+    let failure = await render(config, timeout: 60)
+
+    // Not a hard cut that completes, not a hang: the job fails with the stall
+    // and never reaches its output.
+    XCTAssertTrue(
+      Self.isWatchdogError(failure),
+      "expected the watchdog's error, got \(String(describing: failure))")
+    XCTAssertFalse(FileManager.default.fileExists(atPath: output.path))
+
+    // And the pipeline is whole afterwards: the same job renders through under
+    // the real bound, so the stall neither wedged the gate nor the sessions.
+    SetupStageExport.stallTimeout = defaultStallTimeout
+    let rerun = await render(config, timeout: 120)
+    XCTAssertNil(rerun)
+    XCTAssertTrue(FileManager.default.fileExists(atPath: output.path))
+  }
+
+  func testAStalledHdrPreTranscodeFailsTheRenderInsteadOfRenderingTheSource() async throws {
+    let palette = ThumbnailTimestampFixture.palette
+    let source: URL
+    do {
+      // HEVC tagged BT.2020 is what `needsTranscodingForEffects` keys on; the
+      // pixels themselves stay 8-bit.
+      source = try ThumbnailTimestampFixture.makeColorVideo(
+        colors: [palette[0], palette[0]],
+        codec: .hevc,
+        colorProperties: [
+          AVVideoColorPrimariesKey: AVVideoColorPrimaries_ITU_R_2020,
+          AVVideoTransferFunctionKey: AVVideoTransferFunction_ITU_R_2100_HLG,
+          AVVideoYCbCrMatrixKey: AVVideoYCbCrMatrix_ITU_R_2020,
+        ])
+    } catch {
+      throw XCTSkip("this environment cannot author an HEVC BT.2020 clip: \(error)")
+    }
+    defer { try? FileManager.default.removeItem(at: source) }
+    guard await VideoTranscoder.needsTranscoding(source.path) else {
+      throw XCTSkip(
+        "the authored clip is not detected as HDR, so the transcode stage never runs")
+    }
+    let output = FileManager.default.temporaryDirectory
+      .appendingPathComponent("pve_stage_transcode_\(UUID().uuidString).mp4")
+    defer { try? FileManager.default.removeItem(at: output) }
+    let config = try XCTUnwrap(
+      RenderConfig.fromArguments([
+        "videoClips": [["inputPath": source.path]],
+        "outputPath": output.path,
+        "outputFormat": "mp4",
+        "enableAudio": false,
+      ]))
+
+    SetupStageExport.stallTimeout = 0.001
+    let failure = await render(config, timeout: 60)
+
+    // Not a render of the HDR source, not a hang: the job fails with the stall
+    // and never reaches its output.
+    XCTAssertTrue(
+      Self.isWatchdogError(failure),
+      "expected the watchdog's error, got \(String(describing: failure))")
+    XCTAssertFalse(FileManager.default.fileExists(atPath: output.path))
+
+    SetupStageExport.stallTimeout = defaultStallTimeout
+    let rerun = await render(config, timeout: 120)
+    XCTAssertNil(rerun)
+    XCTAssertTrue(FileManager.default.fileExists(atPath: output.path))
+  }
+}
+
+// MARK: - Chroma key
+
+/// Cross-platform parity guard for the chroma-key formula.
+///
+/// The golden tables below are duplicated verbatim in the Kotlin test
+/// (`android/src/test/.../ChromaKeyMathTest.kt`). Both run it against their own
+/// implementation — Swift's `chromaKeyed(r:g:b:_:)`, which is baked into the
+/// Core Image color cube, and Kotlin's `ChromaKeyMath`, which the GLSL shader
+/// mirrors. If either platform drifts, one of these two tests fails immediately
+/// instead of the difference surfacing later as "the key looks slightly
+/// different on Android".
+///
+/// **When you change the formula, regenerate both tables.**
+class ChromaKeyMathTests: XCTestCase {
+
+  /// The config the golden table was computed for: SMPTE green, defaults.
+  private let config = ChromaKeyConfig(
+    keyR: Double(0x00) / 255.0,
+    keyG: Double(0xB1) / 255.0,
+    keyB: Double(0x40) / 255.0,
+    similarity: 0.15,
+    smoothness: 0.08,
+    spill: 0.5,
+    backgroundColor: -1,
+    backgroundImage: nil
+  )
+
+  private let tolerance = 1e-4
+
+  /// The same key with a different despill strength.
+  private func withSpill(_ spill: Double) -> ChromaKeyConfig {
+    ChromaKeyConfig(
+      keyR: config.keyR, keyG: config.keyG, keyB: config.keyB,
+      similarity: config.similarity, smoothness: config.smoothness,
+      spill: spill, backgroundColor: -1, backgroundImage: nil)
+  }
+
+  private struct Golden {
+    let name: String
+    let r, g, b: Double
+    let outR, outG, outB, alpha: Double
+  }
+
+  private let golden: [Golden] = [
+    // The key color itself and its neighbourhood: removed completely.
+    Golden(name: "key color", r: 0.0, g: 0.694118, b: 0.25098,
+           outR: 0.218029, outG: 0.565088, outB: 0.343519, alpha: 0.0),
+    Golden(name: "near key", r: 0.05, g: 0.72, b: 0.28,
+           outR: 0.261122, outG: 0.595058, outB: 0.369608, alpha: 0.0),
+    Golden(name: "bright screen", r: 0.35, g: 0.9, b: 0.5,
+           outR: 0.525426, outG: 0.796183, outB: 0.574457, alpha: 0.0),
+    // Half-lit screen: past the default similarity, so only mostly removed.
+    // This is the documented brightness sensitivity, pinned on purpose.
+    Golden(name: "dim screen 50%", r: 0.0, g: 0.347059, b: 0.12549,
+           outR: 0.109015, outG: 0.282544, outB: 0.17176, alpha: 0.081671),
+    // Neutrals sit at the chroma origin, far from any saturated key.
+    Golden(name: "black", r: 0.0, g: 0.0, b: 0.0,
+           outR: 0.0, outG: 0.0, outB: 0.0, alpha: 1.0),
+    Golden(name: "mid gray", r: 0.5, g: 0.5, b: 0.5,
+           outR: 0.5, outG: 0.5, outB: 0.5, alpha: 1.0),
+    Golden(name: "white", r: 1.0, g: 1.0, b: 1.0,
+           outR: 1.0, outG: 1.0, outB: 1.0, alpha: 1.0),
+    // Skin tone — the calibration anchor quoted in the Dart docs.
+    Golden(name: "skin tone", r: 0.86, g: 0.65, b: 0.53,
+           outR: 0.86, outG: 0.65, outB: 0.53, alpha: 1.0),
+    Golden(name: "pure red", r: 1.0, g: 0.0, b: 0.0,
+           outR: 1.0, outG: 0.0, outB: 0.0, alpha: 1.0),
+    Golden(name: "pure blue", r: 0.0, g: 0.0, b: 1.0,
+           outR: 0.0, outG: 0.0, outB: 1.0, alpha: 1.0),
+    // Kept, but despilled: the green cast is pulled out at full alpha.
+    Golden(name: "green-spilled gray", r: 0.55, g: 0.75, b: 0.55,
+           outR: 0.616767, outG: 0.710487, outB: 0.578338, alpha: 1.0),
+    // Leans away from the key hue, so despill leaves it alone.
+    Golden(name: "magenta", r: 0.8, g: 0.2, b: 0.8,
+           outR: 0.8, outG: 0.2, outB: 0.8, alpha: 1.0),
+  ]
+
+  func testGoldenTableMatchesTheSharedFormula() {
+    for row in golden {
+      let out = chromaKeyed(r: row.r, g: row.g, b: row.b, config)
+      XCTAssertEqual(out.r, row.outR, accuracy: tolerance, "\(row.name): r")
+      XCTAssertEqual(out.g, row.outG, accuracy: tolerance, "\(row.name): g")
+      XCTAssertEqual(out.b, row.outB, accuracy: tolerance, "\(row.name): b")
+      XCTAssertEqual(out.a, row.alpha, accuracy: tolerance, "\(row.name): alpha")
+    }
+  }
+
+  /// A light gray wall (`0xD9D9D9`), the neutral key. Same similarity and
+  /// smoothness as `config`; spill is irrelevant, a neutral key has no hue.
+  private let wall = ChromaKeyConfig(
+    keyR: Double(0xD9) / 255.0,
+    keyG: Double(0xD9) / 255.0,
+    keyB: Double(0xD9) / 255.0,
+    similarity: 0.15,
+    smoothness: 0.08,
+    spill: 0.5,
+    backgroundColor: -1,
+    backgroundImage: nil
+  )
+
+  private let neutralGolden: [Golden] = [
+    // The wall itself, and the wall a little darker: removed.
+    Golden(name: "key color", r: 0.85098, g: 0.85098, b: 0.85098,
+           outR: 0.85098, outG: 0.85098, outB: 0.85098, alpha: 0.0),
+    Golden(name: "wall at 85%", r: 0.723333, g: 0.723333, b: 0.723333,
+           outR: 0.723333, outG: 0.723333, outB: 0.723333, alpha: 0.0),
+    Golden(name: "white", r: 1.0, g: 1.0, b: 1.0,
+           outR: 1.0, outG: 1.0, outB: 1.0, alpha: 0.0),
+    // A deep shadow on the wall survives: brightness now counts.
+    Golden(name: "wall in shadow 60%", r: 0.510588, g: 0.510588, b: 0.510588,
+           outR: 0.510588, outG: 0.510588, outB: 0.510588, alpha: 1.0),
+    // What a chroma-only key removed along with the wall, now kept.
+    Golden(name: "black", r: 0.0, g: 0.0, b: 0.0,
+           outR: 0.0, outG: 0.0, outB: 0.0, alpha: 1.0),
+    Golden(name: "mid gray", r: 0.5, g: 0.5, b: 0.5,
+           outR: 0.5, outG: 0.5, outB: 0.5, alpha: 1.0),
+    Golden(name: "navy", r: 0.2, g: 0.22, b: 0.35,
+           outR: 0.2, outG: 0.22, outB: 0.35, alpha: 1.0),
+    // The hard case, pinned on purpose: skin crowds a light wall.
+    Golden(name: "skin tone", r: 0.86, g: 0.65, b: 0.53,
+           outR: 0.86, outG: 0.65, outB: 0.53, alpha: 0.882915),
+    Golden(name: "beige", r: 0.85, g: 0.78, b: 0.65,
+           outR: 0.85, outG: 0.78, outB: 0.65, alpha: 0.0),
+    Golden(name: "smpte green", r: 0.0, g: 0.694118, b: 0.25098,
+           outR: 0.0, outG: 0.694118, outB: 0.25098, alpha: 1.0),
+  ]
+
+  func testNeutralGoldenTableMatchesTheSharedFormula() {
+    for row in neutralGolden { assertGolden(row, wall) }
+  }
+
+  func testSaturatedKeysIgnoreBrightness() {
+    // Weight 0 keeps every green- and blue-screen result identical to the
+    // chroma-only formula.
+    XCTAssertEqual(config.lumaWeight, 0.0)
+    let blue = ChromaKeyConfig(
+      keyR: 0, keyG: Double(0x47) / 255.0, keyB: Double(0xBB) / 255.0,
+      similarity: 0.12, smoothness: 0.08, spill: 0.5,
+      backgroundColor: -1, backgroundImage: nil)
+    XCTAssertEqual(blue.lumaWeight, 0.0)
+  }
+
+  func testNeutralKeysWeighBrightnessFully() {
+    XCTAssertEqual(wall.lumaWeight, 1.0)
+    let black = ChromaKeyConfig(
+      keyR: 0, keyG: 0, keyB: 0,
+      similarity: 0.12, smoothness: 0.08, spill: 0.5,
+      backgroundColor: -1, backgroundImage: nil)
+    XCTAssertEqual(black.lumaWeight, 1.0)
+  }
+
+  func testLumaWeightRampsSmoothlyBetweenNeutralAndSaturated() {
+    // Walk the key from neutral toward a pale blue. The weight must fall
+    // monotonically, with intermediate values, so a pale wall never flips
+    // between two formulas.
+    var previous = 2.0
+    let weights = (0...40).map { step -> Double in
+      let t = Double(step) / 40.0
+      let c = chromaOf(r: 0.8 - 0.3 * t, g: 0.8 - 0.1 * t, b: 0.8)
+      let weight = lumaWeightOf(cb: c.cb, cr: c.cr)
+      XCTAssertLessThanOrEqual(weight, previous + tolerance, "weight rose at t=\(t)")
+      previous = weight
+      return weight
+    }
+
+    XCTAssertEqual(weights.first!, 1.0, accuracy: tolerance)
+    XCTAssertEqual(weights.last!, 0.0, accuracy: tolerance)
+    XCTAssertTrue(weights.contains { $0 > 0.01 && $0 < 0.99 }, "expected a ramp, got a step")
+  }
+
+  /// A white wall as a camera records it: faintly warm (`0xDCD9D3`), not
+  /// exactly neutral. Its chroma is tiny but not zero, so it has a despill
+  /// direction; weight 1 must still switch despill off.
+  private let tintedWall = ChromaKeyConfig(
+    keyR: Double(0xDC) / 255.0,
+    keyG: Double(0xD9) / 255.0,
+    keyB: Double(0xD3) / 255.0,
+    similarity: 0.12,
+    smoothness: 0.08,
+    spill: 0.5,
+    backgroundColor: -1,
+    backgroundImage: nil
+  )
+
+  /// A pale beige wall (`0xEDDEC7`), between the two thresholds: weight about
+  /// 0.6, so brightness counts partly and despill runs at about 40%.
+  private let beigeWall = ChromaKeyConfig(
+    keyR: Double(0xED) / 255.0,
+    keyG: Double(0xDE) / 255.0,
+    keyB: Double(0xC7) / 255.0,
+    similarity: 0.12,
+    smoothness: 0.08,
+    spill: 0.5,
+    backgroundColor: -1,
+    backgroundImage: nil
+  )
+
+  private let tintedGolden: [Golden] = [
+    Golden(name: "key color", r: 0.862745, g: 0.85098, b: 0.827451,
+           outR: 0.862745, outG: 0.85098, outB: 0.827451, alpha: 0.0),
+    // Leaning toward the wall's faint warm tint, yet not desaturated.
+    Golden(name: "skin tone", r: 0.86, g: 0.65, b: 0.53,
+           outR: 0.86, outG: 0.65, outB: 0.53, alpha: 1.0),
+    Golden(name: "red shirt", r: 0.8, g: 0.15, b: 0.15,
+           outR: 0.8, outG: 0.15, outB: 0.15, alpha: 1.0),
+    Golden(name: "orange", r: 0.9, g: 0.5, b: 0.1,
+           outR: 0.9, outG: 0.5, outB: 0.1, alpha: 1.0),
+    Golden(name: "denim", r: 0.231373, g: 0.356863, b: 0.54902,
+           outR: 0.231373, outG: 0.356863, outB: 0.54902, alpha: 1.0),
+  ]
+
+  private let beigeGolden: [Golden] = [
+    Golden(name: "key color", r: 0.929412, g: 0.870588, b: 0.780392,
+           outR: 0.918988, outG: 0.872066, outB: 0.80012, alpha: 0.0),
+    Golden(name: "black", r: 0.0, g: 0.0, b: 0.0,
+           outR: 0.0, outG: 0.0, outB: 0.0, alpha: 1.0),
+    // Skin crowds a beige wall: the hard case, pinned on purpose.
+    Golden(name: "skin tone", r: 0.86, g: 0.65, b: 0.53,
+           outR: 0.837457, outG: 0.653197, outB: 0.572665, alpha: 0.129278),
+    // Despilled, but at the faded strength.
+    Golden(name: "red shirt", r: 0.8, g: 0.15, b: 0.15,
+           outR: 0.757197, outG: 0.15607, outB: 0.231009, alpha: 1.0),
+    Golden(name: "orange", r: 0.9, g: 0.5, b: 0.1,
+           outR: 0.844612, outG: 0.507855, outB: 0.204826, alpha: 1.0),
+    Golden(name: "denim", r: 0.231373, g: 0.356863, b: 0.54902,
+           outR: 0.231373, outG: 0.356863, outB: 0.54902, alpha: 1.0),
+  ]
+
+  func testTintedGoldenTableNearNeutralKeyDoesNotDespill() {
+    XCTAssertEqual(tintedWall.lumaWeight, 1.0)
+    for row in tintedGolden { assertGolden(row, tintedWall) }
+  }
+
+  func testBeigeGoldenTableMatchesTheSharedFormula() {
+    for row in beigeGolden { assertGolden(row, beigeWall) }
+  }
+
+  private func assertGolden(_ row: Golden, _ key: ChromaKeyConfig) {
+    let out = chromaKeyed(r: row.r, g: row.g, b: row.b, key)
+    XCTAssertEqual(out.r, row.outR, accuracy: tolerance, "\(row.name): r")
+    XCTAssertEqual(out.g, row.outG, accuracy: tolerance, "\(row.name): g")
+    XCTAssertEqual(out.b, row.outB, accuracy: tolerance, "\(row.name): b")
+    XCTAssertEqual(out.a, row.alpha, accuracy: tolerance, "\(row.name): alpha")
+  }
+
+  func testKeyColorIsRemovedCompletely() {
+    let out = chromaKeyed(r: config.keyR, g: config.keyG, b: config.keyB, config)
+    XCTAssertEqual(out.a, 0.0, accuracy: tolerance)
+  }
+
+  func testSoftEdgeProducesPartialAlpha() {
+    // Walk the key color toward neutral gray and collect the alpha ramp.
+    let ramp: [Double] = (0...60).map { step in
+      let t = Double(step) / 60.0
+      return chromaKeyed(
+        r: config.keyR + (0.5 - config.keyR) * t,
+        g: config.keyG + (0.5 - config.keyG) * t,
+        b: config.keyB + (0.5 - config.keyB) * t,
+        config
+      ).a
+    }
+
+    XCTAssertTrue(ramp.contains(0.0), "expected a fully keyed sample")
+    XCTAssertTrue(ramp.contains(1.0), "expected a fully opaque sample")
+    XCTAssertTrue(
+      ramp.contains { $0 > 0.01 && $0 < 0.99 },
+      "expected a soft edge, but alpha jumped straight from 0 to 1")
+  }
+
+  func testSpillPullsTheKeyCastOutWithoutDarkening() {
+    let noSpill = withSpill(0.0)
+    let fullSpill = withSpill(1.0)
+
+    let without = chromaKeyed(r: 0.55, g: 0.75, b: 0.55, noSpill)
+    let with = chromaKeyed(r: 0.55, g: 0.75, b: 0.55, fullSpill)
+
+    let castBefore = without.g - max(without.r, without.b)
+    let castAfter = with.g - max(with.r, with.b)
+    XCTAssertLessThan(castAfter, castBefore, "despill did not reduce the green cast")
+
+    // Luma is preserved, so despill never darkens the subject.
+    XCTAssertEqual(
+      lumaOf(r: without.r, g: without.g, b: without.b),
+      lumaOf(r: with.r, g: with.g, b: with.b),
+      accuracy: 1e-3)
+  }
+
+  func testMatteIsBrightnessSensitiveAsDocumented() {
+    // Cb/Cr scale with brightness, so a dimly lit patch of the screen sits
+    // closer to neutral and further from the key point. The default similarity
+    // covers roughly 55%..100% of the reference brightness. Pinned because the
+    // Dart docs promise exactly this.
+    func screenAt(_ fraction: Double) -> Double {
+      chromaKeyed(
+        r: config.keyR * fraction, g: config.keyG * fraction,
+        b: config.keyB * fraction, config
+      ).a
+    }
+
+    XCTAssertEqual(screenAt(1.0), 0.0, accuracy: tolerance)
+    XCTAssertEqual(screenAt(0.55), 0.0, accuracy: tolerance)
+    XCTAssertGreaterThan(screenAt(0.5), 0.0, "a half-lit screen should start to survive")
+  }
+
+  func testNeutralKeyColorDisablesDespillInsteadOfDividingByZero() {
+    let gray = ChromaKeyConfig(
+      keyR: 0.5, keyG: 0.5, keyB: 0.5, similarity: 0.15, smoothness: 0.08,
+      spill: 1.0, backgroundColor: -1, backgroundImage: nil)
+
+    XCTAssertEqual(gray.keyDirection.cb, 0.0, accuracy: tolerance)
+    XCTAssertEqual(gray.keyDirection.cr, 0.0, accuracy: tolerance)
+
+    let out = chromaKeyed(r: 0.8, g: 0.2, b: 0.4, gray)
+    XCTAssertFalse(out.r.isNaN || out.g.isNaN || out.b.isNaN || out.a.isNaN)
+  }
+
+  /// The cube is what actually runs on Apple, so verify it carries the same
+  /// numbers **and** that its entries are premultiplied, which `CIColorCube`
+  /// requires and which is the one place Apple and Android must differ.
+  func testCubeIsPremultipliedAndMatchesTheFormula() throws {
+    let size = 33
+    let data = try XCTUnwrap(
+      generateChromaLUTData(chroma: config, size: size))
+
+    XCTAssertEqual(data.count, size * size * size * 4 * MemoryLayout<Float>.size)
+
+    let floats: [Float] = data.withUnsafeBytes { Array($0.bindMemory(to: Float.self)) }
+
+    // Walk the cube's own sample grid, so no interpolation is involved.
+    for bi in stride(from: 0, to: size, by: 8) {
+      for gi in stride(from: 0, to: size, by: 8) {
+        for ri in stride(from: 0, to: size, by: 8) {
+          let rf = Double(ri) / Double(size - 1)
+          let gf = Double(gi) / Double(size - 1)
+          let bf = Double(bi) / Double(size - 1)
+          let expected = chromaKeyed(r: rf, g: gf, b: bf, config)
+
+          let offset = (bi * size * size + gi * size + ri) * 4
+          XCTAssertEqual(
+            Double(floats[offset]), expected.r * expected.a, accuracy: 1e-5)
+          XCTAssertEqual(
+            Double(floats[offset + 1]), expected.g * expected.a, accuracy: 1e-5)
+          XCTAssertEqual(
+            Double(floats[offset + 2]), expected.b * expected.a, accuracy: 1e-5)
+          XCTAssertEqual(Double(floats[offset + 3]), expected.a, accuracy: 1e-5)
+        }
+      }
+    }
+  }
+
+  /// A fully keyed entry must be `(0, 0, 0, 0)`, not `(rgb, 0)` — Core Image
+  /// would otherwise composite the key color back in at the edges.
+  func testFullyKeyedCubeEntriesAreZero() throws {
+    let size = 33
+    let data = try XCTUnwrap(
+      generateChromaLUTData(chroma: config, size: size))
+    let floats: [Float] = data.withUnsafeBytes { Array($0.bindMemory(to: Float.self)) }
+
+    // Nearest grid point to the key color.
+    let ri = Int((config.keyR * Double(size - 1)).rounded())
+    let gi = Int((config.keyG * Double(size - 1)).rounded())
+    let bi = Int((config.keyB * Double(size - 1)).rounded())
+    let offset = (bi * size * size + gi * size + ri) * 4
+
+    XCTAssertEqual(floats[offset + 3], 0.0, accuracy: 1e-5, "key should be fully removed")
+    XCTAssertEqual(floats[offset], 0.0, accuracy: 1e-5, "premultiplied red must be 0")
+    XCTAssertEqual(floats[offset + 1], 0.0, accuracy: 1e-5, "premultiplied green must be 0")
+    XCTAssertEqual(floats[offset + 2], 0.0, accuracy: 1e-5, "premultiplied blue must be 0")
+  }
+
+  /// Two different background images of the same byte length must not share a
+  /// cache entry, or the second clip renders the first one's backdrop.
+  func testCacheKeySeparatesEqualLengthBackgrounds() {
+    func withBackground(_ bytes: [UInt8]) -> ChromaKeyConfig {
+      ChromaKeyConfig(
+        keyR: config.keyR, keyG: config.keyG, keyB: config.keyB,
+        similarity: config.similarity, smoothness: config.smoothness,
+        spill: config.spill, backgroundColor: -1,
+        backgroundImage: .bytes(Data(bytes)))
+    }
+
+    let a = withBackground(Array(repeating: 0x11, count: 128))
+    var bBytes = Array(repeating: UInt8(0x11), count: 128)
+    bBytes[0] = 0x22
+    let b = withBackground(bBytes)
+
+    XCTAssertEqual(a.backgroundImage?.data?.count, b.backgroundImage?.data?.count)
+    XCTAssertNotEqual(a.cacheKey, b.cacheKey)
+    XCTAssertEqual(a.cacheKey, withBackground(Array(repeating: 0x11, count: 128)).cacheKey)
+  }
+
+  /// A key with no background image at all keeps a stable, distinct key.
+  func testCacheKeyIsStableWithoutABackgroundImage() {
+    XCTAssertEqual(config.cacheKey, config.cacheKey)
+    XCTAssertNotEqual(config.cacheKey, withSpill(0.9).cacheKey)
+  }
+
+}
+
+// MARK: - EXIF orientation on caller-supplied images
+
+/// `decodeOrientedImage` must honor the EXIF `Orientation` tag.
+///
+/// A phone stores a portrait photo as *landscape* pixels plus a tag saying how
+/// to turn them, and the chroma-key background and image layers are fed exactly
+/// those bytes. This is the decode that keeps them upright, and that keeps iOS,
+/// macOS and Android agreeing on the same input — Android pins the same contract
+/// in `ImageOrientationTest`.
+///
+/// The fixtures are built here rather than checked in because the usual encoders
+/// bake the orientation into the pixels and drop the tag, so a "landscape pixels
+/// + Orientation=6" image cannot be produced by round-tripping one. The APP1
+/// EXIF segment is spliced in by hand instead; see
+/// `OrientedImageFixture.tagging(_:orientation:)`.
+class DecodeOrientedImageTests: XCTestCase {
+
+  /// Stored (pre-orientation) size: deliberately landscape, so an orientation
+  /// that is honored is visible as a portrait result.
+  private let storedWidth = 32
+  private let storedHeight = 16
+
+  /// EXIF 6: "the 0th row is the visual right side" — display by rotating the
+  /// stored pixels 90° clockwise.
+  private let rotate90 = OrientedImageFixture.orientationRotate90
+
+  private func untaggedJpeg() throws -> Data {
+    try XCTUnwrap(OrientedImageFixture.quadrantJpeg(width: storedWidth, height: storedHeight))
+  }
+
+  private func taggedJpeg() throws -> Data {
+    OrientedImageFixture.tagging(try untaggedJpeg(), orientation: rotate90)
+  }
+
+  /// Guards the hand-written APP1 segment itself. Without this, a splice that
+  /// silently produced no tag would make every "not rotated" assertion below
+  /// pass for the wrong reason.
+  func testFixtureCarriesTheOrientationTagItClaimsTo() throws {
+    XCTAssertEqual(OrientedImageFixture.declaredOrientation(try taggedJpeg()), rotate90)
+    XCTAssertEqual(OrientedImageFixture.declaredOrientation(try untaggedJpeg()), nil)
+  }
+
+  func testExifOrientationSwapsTheDecodedDimensions() throws {
+    let image = try XCTUnwrap(decodeOrientedImage(try taggedJpeg()))
+
+    // Swapped relative to the pixels actually stored in the file.
+    XCTAssertEqual(image.extent.width, CGFloat(storedHeight))
+    XCTAssertEqual(image.extent.height, CGFloat(storedWidth))
+    XCTAssertEqual(image.extent.origin, .zero)
+  }
+
+  /// The counter-test: without it, "rotate everything" would satisfy the
+  /// assertion above.
+  func testUntaggedImageIsNotRotated() throws {
+    let image = try XCTUnwrap(decodeOrientedImage(try untaggedJpeg()))
+
+    XCTAssertEqual(image.extent.width, CGFloat(storedWidth))
+    XCTAssertEqual(image.extent.height, CGFloat(storedHeight))
+    XCTAssertEqual(image.extent.origin, .zero)
+  }
+
+  /// Extent alone would also be satisfied by a decode that swapped the size and
+  /// left the pixels where they were, so check where the quadrants landed.
+  ///
+  /// Rotating the stored image 90° clockwise sends top-left → top-right,
+  /// top-right → bottom-right, bottom-right → bottom-left, bottom-left →
+  /// top-left.
+  func testExifOrientationRotatesThePixelsAndNotJustTheExtent() throws {
+    let image = try XCTUnwrap(decodeOrientedImage(try taggedJpeg()))
+    let quadrants = try XCTUnwrap(OrientedImageFixture.quadrants(of: image))
+
+    XCTAssertEqual(quadrants.topLeft, .bottomLeft)
+    XCTAssertEqual(quadrants.topRight, .topLeft)
+    XCTAssertEqual(quadrants.bottomLeft, .bottomRight)
+    XCTAssertEqual(quadrants.bottomRight, .topRight)
+  }
+
+  func testUntaggedImageKeepsItsQuadrantsWhereTheyWere() throws {
+    let image = try XCTUnwrap(decodeOrientedImage(try untaggedJpeg()))
+    let quadrants = try XCTUnwrap(OrientedImageFixture.quadrants(of: image))
+
+    XCTAssertEqual(quadrants.topLeft, .topLeft)
+    XCTAssertEqual(quadrants.topRight, .topRight)
+    XCTAssertEqual(quadrants.bottomLeft, .bottomLeft)
+    XCTAssertEqual(quadrants.bottomRight, .bottomRight)
+  }
+
+  /// The case `NSImage` used to paper over on macOS: it rasterized every source
+  /// into RGB before the compositor saw it, whereas `CGImageSource` hands back
+  /// the file's own color space — so a one-component grayscale JPEG now reaches
+  /// CoreImage as gray, and the render path's `CIContext` does no color
+  /// management (`workingColorSpace: NSNull`). Pins that such an image still
+  /// lands on the right pixels, and still turns.
+  ///
+  /// Classified by rank, not by value: a transfer function may move the levels,
+  /// but it must not reorder them, and `grayQuadrants` refuses to guess when two
+  /// of them come back equal — which is what a flattened or blank decode looks
+  /// like.
+  func testGrayscaleImageDecodesAndStillOrients() throws {
+    let untagged = try XCTUnwrap(
+      OrientedImageFixture.grayscaleQuadrantJpeg(width: storedWidth, height: storedHeight))
+    let tagged = OrientedImageFixture.tagging(untagged, orientation: rotate90)
+
+    let plain = try XCTUnwrap(decodeOrientedImage(untagged))
+    XCTAssertEqual(plain.extent.width, CGFloat(storedWidth))
+    XCTAssertEqual(plain.extent.height, CGFloat(storedHeight))
+    let asStored = try XCTUnwrap(OrientedImageFixture.grayQuadrants(of: plain))
+    XCTAssertEqual(asStored.topLeft, .topLeft)
+    XCTAssertEqual(asStored.topRight, .topRight)
+    XCTAssertEqual(asStored.bottomLeft, .bottomLeft)
+    XCTAssertEqual(asStored.bottomRight, .bottomRight)
+
+    let rotated = try XCTUnwrap(decodeOrientedImage(tagged))
+    XCTAssertEqual(rotated.extent.width, CGFloat(storedHeight))
+    XCTAssertEqual(rotated.extent.height, CGFloat(storedWidth))
+    let asDisplayed = try XCTUnwrap(OrientedImageFixture.grayQuadrants(of: rotated))
+    XCTAssertEqual(asDisplayed.topLeft, .bottomLeft)
+    XCTAssertEqual(asDisplayed.topRight, .topLeft)
+    XCTAssertEqual(asDisplayed.bottomLeft, .bottomRight)
+    XCTAssertEqual(asDisplayed.bottomRight, .topRight)
+  }
+
+  func testUndecodableBytesReturnNil() {
+    XCTAssertNil(decodeOrientedImage(Data([0x00, 0x01, 0x02, 0x03])))
+    XCTAssertNil(decodeOrientedImage(Data()))
+  }
+}
+
+// MARK: - Track orientation (preferredTransform) in CoreImage space
+
+/// `applyingAVFoundationTransform` must orient a frame the way AVFoundation
+/// displays it.
+///
+/// A track's `preferredTransform` is written for a y-down space, CoreImage is
+/// y-up: applied as is, a quarter turn goes the other way and a portrait phone
+/// recording in a `VideoComposition` came out upside down. Both compositor paths
+/// orient through this helper, so every orientation a display matrix can
+/// express is pinned here, with and without the translation files carry.
+///
+/// Expected quadrants are worked out in AVFoundation's y-down space, e.g. the
+/// phone turn (x, y) → (h - y, x) sends the stored top-left corner to the top
+/// right.
+class AVFoundationTransformTests: XCTestCase {
+
+  private typealias Corner = OrientedImageFixture.Corner
+
+  /// Stored size: landscape, so a quarter turn shows as a swapped extent.
+  private let width: CGFloat = 32
+  private let height: CGFloat = 16
+
+  private func assertOrients(
+    _ transform: CGAffineTransform,
+    topLeft: Corner, topRight: Corner, bottomLeft: Corner, bottomRight: Corner,
+    swapsSize: Bool,
+    file: StaticString = #filePath, line: UInt = #line
+  ) throws {
+    let jpeg = try XCTUnwrap(
+      OrientedImageFixture.quadrantJpeg(width: Int(width), height: Int(height)),
+      file: file, line: line)
+    let stored = try XCTUnwrap(CIImage(data: jpeg), file: file, line: line)
+
+    let image = applyingAVFoundationTransform(transform, to: stored)
+
+    XCTAssertEqual(image.extent.origin, .zero, file: file, line: line)
+    XCTAssertEqual(image.extent.width, swapsSize ? height : width, file: file, line: line)
+    XCTAssertEqual(image.extent.height, swapsSize ? width : height, file: file, line: line)
+    let quadrants = try XCTUnwrap(
+      OrientedImageFixture.quadrants(of: image), file: file, line: line)
+    XCTAssertEqual(quadrants.topLeft, topLeft, "top left", file: file, line: line)
+    XCTAssertEqual(quadrants.topRight, topRight, "top right", file: file, line: line)
+    XCTAssertEqual(quadrants.bottomLeft, bottomLeft, "bottom left", file: file, line: line)
+    XCTAssertEqual(quadrants.bottomRight, bottomRight, "bottom right", file: file, line: line)
+  }
+
+  /// ffprobe `rotation=-90`, what a portrait phone recording carries.
+  func testPhoneRecordingFlagTurnsClockwise() throws {
+    try assertOrients(
+      CGAffineTransform(a: 0, b: 1, c: -1, d: 0, tx: height, ty: 0),
+      topLeft: .bottomLeft, topRight: .topLeft, bottomLeft: .bottomRight,
+      bottomRight: .topRight, swapsSize: true)
+  }
+
+  /// ffmpeg's `-display_rotation -90` writes the turn without a translation
+  /// (`test_g.mp4`); only the extent moves, and that is normalized away.
+  func testTheTranslationOfTheMatrixDoesNotMoveTheFrame() throws {
+    for (tx, ty) in [(CGFloat(0), CGFloat(0)), (37, -11)] {
+      try assertOrients(
+        CGAffineTransform(a: 0, b: 1, c: -1, d: 0, tx: tx, ty: ty),
+        topLeft: .bottomLeft, topRight: .topLeft, bottomLeft: .bottomRight,
+        bottomRight: .topRight, swapsSize: true)
+    }
+  }
+
+  /// ffprobe `rotation=90`.
+  func testCounterClockwiseFlagTurnsCounterClockwise() throws {
+    try assertOrients(
+      CGAffineTransform(a: 0, b: -1, c: 1, d: 0, tx: 0, ty: width),
+      topLeft: .topRight, topRight: .bottomRight, bottomLeft: .topLeft,
+      bottomRight: .bottomLeft, swapsSize: true)
+  }
+
+  func testHalfTurn() throws {
+    try assertOrients(
+      CGAffineTransform(a: -1, b: 0, c: 0, d: -1, tx: width, ty: height),
+      topLeft: .bottomRight, topRight: .bottomLeft, bottomLeft: .topRight,
+      bottomRight: .topLeft, swapsSize: false)
+  }
+
+  func testHorizontalMirror() throws {
+    try assertOrients(
+      CGAffineTransform(a: -1, b: 0, c: 0, d: 1, tx: width, ty: 0),
+      topLeft: .topRight, topRight: .topLeft, bottomLeft: .bottomRight,
+      bottomRight: .bottomLeft, swapsSize: false)
+  }
+
+  func testVerticalMirror() throws {
+    try assertOrients(
+      CGAffineTransform(a: 1, b: 0, c: 0, d: -1, tx: 0, ty: height),
+      topLeft: .bottomLeft, topRight: .bottomRight, bottomLeft: .topLeft,
+      bottomRight: .topRight, swapsSize: false)
+  }
+
+  /// Mirrored quarter turns, as some front-camera recordings carry. A y-flip
+  /// on only one side of the transform turns these into each other.
+  func testTranspose() throws {
+    try assertOrients(
+      CGAffineTransform(a: 0, b: 1, c: 1, d: 0, tx: 0, ty: 0),
+      topLeft: .topLeft, topRight: .bottomLeft, bottomLeft: .topRight,
+      bottomRight: .bottomRight, swapsSize: true)
+  }
+
+  func testAntiTranspose() throws {
+    try assertOrients(
+      CGAffineTransform(a: 0, b: -1, c: -1, d: 0, tx: height, ty: width),
+      topLeft: .bottomRight, topRight: .topRight, bottomLeft: .bottomLeft,
+      bottomRight: .topLeft, swapsSize: true)
+  }
+}
+
+// MARK: - EXIF orientation test fixtures
+
+/// Builds and reads back the EXIF-orientation fixtures.
+///
+/// Duplicated in the iOS and macOS RunnerTests: they are separate test targets
+/// with no shared source directory, as `ThumbnailTimestampFixture` already is.
+/// Keep the two copies in step.
+enum OrientedImageFixture {
+
+  /// EXIF `Orientation` = 6, i.e. display by rotating the stored pixels 90° CW.
+  static let orientationRotate90: UInt32 = 6
+
+  /// Which corner of the *stored* image a color came from. Each quadrant of the
+  /// fixture gets its own color, so a rotation is readable as a permutation.
+  enum Corner: CaseIterable {
+    case topLeft, topRight, bottomLeft, bottomRight
+
+    var rgb: (r: UInt8, g: UInt8, b: UInt8) {
+      switch self {
+      case .topLeft: return (255, 0, 0)  // red
+      case .topRight: return (0, 255, 0)  // green
+      case .bottomLeft: return (0, 0, 255)  // blue
+      case .bottomRight: return (255, 255, 0)  // yellow
+      }
+    }
+
+    /// The grayscale fixture's level for this corner. Strictly increasing in
+    /// the order the cases are declared, which is what lets `grayQuadrants`
+    /// classify by rank instead of by value.
+    var gray: UInt8 {
+      switch self {
+      case .topLeft: return 16
+      case .topRight: return 96
+      case .bottomLeft: return 176
+      case .bottomRight: return 248
+      }
+    }
+  }
+
+  struct Quadrants {
+    let topLeft: Corner
+    let topRight: Corner
+    let bottomLeft: Corner
+    let bottomRight: Corner
+  }
+
+  /// A JPEG whose four quadrants are four distinct flat colors.
+  ///
+  /// Built from raw top-down raster bytes, so "row 0 is the top" is a property of
+  /// the fixture rather than something the test has to assume about a drawing
+  /// context.
+  static func quadrantJpeg(width: Int, height: Int) -> Data? {
+    var raster = [UInt8]()
+    raster.reserveCapacity(width * height * 4)
+    for row in 0..<height {
+      for col in 0..<width {
+        let rgb = corner(col: col, row: row, width: width, height: height).rgb
+        raster.append(contentsOf: [rgb.r, rgb.g, rgb.b, 255])
+      }
+    }
+
+    guard let provider = CGDataProvider(data: Data(raster) as CFData),
+      let image = CGImage(
+        width: width,
+        height: height,
+        bitsPerComponent: 8,
+        bitsPerPixel: 32,
+        bytesPerRow: width * 4,
+        space: CGColorSpaceCreateDeviceRGB(),
+        bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.noneSkipLast.rawValue),
+        provider: provider,
+        decode: nil,
+        shouldInterpolate: false,
+        intent: .defaultIntent)
+    else { return nil }
+
+    return encodeJpeg(image)
+  }
+
+  /// A one-component grayscale JPEG whose four quadrants are four distinct gray
+  /// levels — the same layout as `quadrantJpeg`, in a color space that is not
+  /// RGB.
+  static func grayscaleQuadrantJpeg(width: Int, height: Int) -> Data? {
+    var raster = [UInt8]()
+    raster.reserveCapacity(width * height)
+    for row in 0..<height {
+      for col in 0..<width {
+        raster.append(corner(col: col, row: row, width: width, height: height).gray)
+      }
+    }
+
+    guard let provider = CGDataProvider(data: Data(raster) as CFData),
+      let image = CGImage(
+        width: width,
+        height: height,
+        bitsPerComponent: 8,
+        bitsPerPixel: 8,
+        bytesPerRow: width,
+        space: CGColorSpaceCreateDeviceGray(),
+        bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.none.rawValue),
+        provider: provider,
+        decode: nil,
+        shouldInterpolate: false,
+        intent: .defaultIntent)
+    else { return nil }
+
+    return encodeJpeg(image)
+  }
+
+  /// Encodes `image` as a maximum-quality JPEG: the quadrant centers are sampled
+  /// far from the color edges, so what ringing survives cannot flip a
+  /// classification.
+  private static func encodeJpeg(_ image: CGImage) -> Data? {
+    let encoded = NSMutableData()
+    guard
+      let destination = CGImageDestinationCreateWithData(
+        encoded, "public.jpeg" as CFString, 1, nil)
+    else { return nil }
+    CGImageDestinationAddImage(
+      destination, image,
+      [kCGImageDestinationLossyCompressionQuality: 1.0] as CFDictionary)
+    guard CGImageDestinationFinalize(destination) else { return nil }
+    return encoded as Data
+  }
+
+  /// Splices a minimal APP1 EXIF segment declaring `orientation` into `jpeg`.
+  ///
+  /// Written out byte by byte because the encoders bake the orientation in and
+  /// drop the tag: a TIFF header, one IFD entry for tag `0x0112` (Orientation),
+  /// type SHORT, and no next IFD.
+  static func tagging(_ jpeg: Data, orientation: UInt32) -> Data {
+    let app1: [UInt8] = [
+      0xFF, 0xE1, 0x00, 0x22,  // APP1, length 34 = 2 + 32 bytes of payload
+      0x45, 0x78, 0x69, 0x66, 0x00, 0x00,  // "Exif\0\0"
+      0x4D, 0x4D, 0x00, 0x2A,  // TIFF header, big-endian ("MM")
+      0x00, 0x00, 0x00, 0x08,  // IFD0 sits 8 bytes in
+      0x00, 0x01,  // one entry
+      0x01, 0x12,  // tag 0x0112: Orientation
+      0x00, 0x03,  // type 3: SHORT
+      0x00, 0x00, 0x00, 0x01,  // count 1
+      0x00, UInt8(orientation), 0x00, 0x00,  // the value, left-aligned
+      0x00, 0x00, 0x00, 0x00,  // no next IFD
+    ]
+
+    var bytes = [UInt8](jpeg)
+    bytes.insert(contentsOf: app1, at: app1InsertionPoint(bytes))
+    return Data(bytes)
+  }
+
+  /// The EXIF orientation `jpeg` declares, or nil when it declares none.
+  static func declaredOrientation(_ jpeg: Data) -> UInt32? {
+    guard let source = CGImageSourceCreateWithData(jpeg as CFData, nil),
+      let properties = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [CFString: Any]
+    else { return nil }
+    return properties[kCGImagePropertyOrientation] as? UInt32
+  }
+
+  /// Classifies the four quadrant centers of `image` back to the stored corner
+  /// each color came from.
+  static func quadrants(of image: CIImage) -> Quadrants? {
+    guard let raster = raster(of: image) else { return nil }
+    let (pixels, width, height) = raster
+    guard width >= 2, height >= 2 else { return nil }
+
+    func corner(atFractionX fx: Double, y fy: Double) -> Corner {
+      let col = min(width - 1, Int(Double(width) * fx))
+      let row = min(height - 1, Int(Double(height) * fy))
+      let offset = (row * width + col) * 4
+      return nearestCorner((pixels[offset], pixels[offset + 1], pixels[offset + 2]))
+    }
+
+    return Quadrants(
+      topLeft: corner(atFractionX: 0.25, y: 0.25),
+      topRight: corner(atFractionX: 0.75, y: 0.25),
+      bottomLeft: corner(atFractionX: 0.25, y: 0.75),
+      bottomRight: corner(atFractionX: 0.75, y: 0.75))
+  }
+
+  /// Classifies the four quadrant centers of a grayscale `image` back to the
+  /// stored corner each level came from, by **rank** rather than by value: the
+  /// decode may put the levels through a transfer function, but it must not
+  /// reorder them.
+  ///
+  /// Returns nil when two centers come back equal — a flattened or blank decode
+  /// would otherwise be ranked into some arbitrary permutation and could pass by
+  /// luck.
+  static func grayQuadrants(of image: CIImage) -> Quadrants? {
+    guard let raster = raster(of: image) else { return nil }
+    let (pixels, width, height) = raster
+    guard width >= 2, height >= 2 else { return nil }
+
+    func level(atFractionX fx: Double, y fy: Double) -> UInt8 {
+      let col = min(width - 1, Int(Double(width) * fx))
+      let row = min(height - 1, Int(Double(height) * fy))
+      return pixels[(row * width + col) * 4]
+    }
+
+    // Positions in the order Quadrants declares them.
+    let levels = [
+      level(atFractionX: 0.25, y: 0.25),
+      level(atFractionX: 0.75, y: 0.25),
+      level(atFractionX: 0.25, y: 0.75),
+      level(atFractionX: 0.75, y: 0.75),
+    ]
+    guard Set(levels).count == levels.count else { return nil }
+
+    // Corner.allCases is declared darkest-first, matching Corner.gray.
+    let darkestFirst = Corner.allCases
+    var corners = [Corner](repeating: .topLeft, count: levels.count)
+    for (rank, position) in levels.enumerated()
+      .sorted(by: { $0.element < $1.element })
+      .map({ $0.offset })
+      .enumerated()
+    {
+      corners[position] = darkestFirst[rank]
+    }
+
+    return Quadrants(
+      topLeft: corners[0], topRight: corners[1],
+      bottomLeft: corners[2], bottomRight: corners[3])
+  }
+
+  /// Which corner of the stored image the pixel at (`col`, `row`) belongs to,
+  /// with row 0 the top.
+  private static func corner(col: Int, row: Int, width: Int, height: Int) -> Corner {
+    let isLeft = col < width / 2
+    let isTop = row < height / 2
+    if isTop { return isLeft ? .topLeft : .topRight }
+    return isLeft ? .bottomLeft : .bottomRight
+  }
+
+  /// `image`'s pixels in raster order, row 0 the top.
+  private static func raster(of image: CIImage) -> (
+    pixels: [UInt8], width: Int, height: Int
+  )? {
+    let context = CIContext(options: [.workingColorSpace: NSNull()])
+    guard let cgImage = context.createCGImage(image, from: image.extent) else { return nil }
+
+    let width = cgImage.width
+    let height = cgImage.height
+    var pixels = [UInt8](repeating: 0, count: width * height * 4)
+    guard
+      let bitmap = CGContext(
+        data: &pixels,
+        width: width,
+        height: height,
+        bitsPerComponent: 8,
+        bytesPerRow: width * 4,
+        space: CGColorSpaceCreateDeviceRGB(),
+        bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)
+    else { return nil }
+
+    bitmap.draw(cgImage, in: CGRect(x: 0, y: 0, width: width, height: height))
+    return (pixels, width, height)
+  }
+
+  /// The quadrant color closest to `color`, so JPEG ringing does not matter.
+  private static func nearestCorner(_ color: (r: UInt8, g: UInt8, b: UInt8)) -> Corner {
+    var best = Corner.topLeft
+    var bestDistance = Int.max
+    for candidate in Corner.allCases {
+      let rgb = candidate.rgb
+      let dr = Int(color.r) - Int(rgb.r)
+      let dg = Int(color.g) - Int(rgb.g)
+      let db = Int(color.b) - Int(rgb.b)
+      let distance = dr * dr + dg * dg + db * db
+      if distance < bestDistance {
+        bestDistance = distance
+        best = candidate
+      }
+    }
+    return best
+  }
+
+  /// Where an APP1 segment may be inserted: after SOI, and after a leading JFIF
+  /// APP0 if the encoder wrote one — putting it first would leave a JFIF file
+  /// whose APP0 no longer follows SOI. Being the *first* APP1 is what matters,
+  /// since that is the one a reader takes.
+  private static func app1InsertionPoint(_ bytes: [UInt8]) -> Int {
+    var index = 2  // past SOI (FFD8)
+    while index + 4 <= bytes.count, bytes[index] == 0xFF, bytes[index + 1] == 0xE0 {
+      index += 2 + (Int(bytes[index + 2]) << 8 | Int(bytes[index + 3]))
+    }
+    return index
+  }
+}
+
+/// Stands in for a `RenderTask`/`AudioExtractTask` in the registry tests.
+private final class FakeJob: ChannelTask {
+  private(set) var isCanceled = false
+  func cancel() { isCanceled = true }
+  func sendSuccess(_ payload: Any?) {}
+  func sendError(_ error: FlutterError) {}
+}
+
+/// Cross-platform parity guard for the video effect pipeline.
+///
+/// The goldens are duplicated verbatim in the Kotlin test
+/// (`android/src/test/.../helpers/VideoEffectMathTest.kt`). They pin the spec
+/// (`reference(_:)` below mirrors Kotlin's `VideoEffectMath`), and the Core
+/// Image stage the compositor runs has to produce the same pixels, give or take
+/// the one-step rounding of Core Image's half-float intermediates.
+///
+/// **When you change the spec, regenerate the checksums in both files.**
+class VideoEffectTests: XCTestCase {
+  private let width = 24
+  private let height = 16
+
+  /// The compositor's context, so the stage is tested the way it renders.
+  private let context = CIContext(options: [
+    .workingColorSpace: NSNull(),
+    .outputColorSpace: CGColorSpace(name: CGColorSpace.sRGB)!,
+  ])
+
+  private func source(_ x: Int, _ y: Int) -> (Int, Int, Int) {
+    ((x * 37 + y * 11) % 256, (x * 13 + y * 29 + 64) % 256, (x * 7 + y * 53 + 128) % 256)
+  }
+
+  private func sourceImage() -> CIImage {
+    var bytes = [UInt8](repeating: 255, count: width * height * 4)
+    for y in 0..<height {
+      for x in 0..<width {
+        let (r, g, b) = source(x, y)
+        let i = (y * width + x) * 4
+        bytes[i] = UInt8(r)
+        bytes[i + 1] = UInt8(g)
+        bytes[i + 2] = UInt8(b)
+      }
+    }
+    return CIImage(
+      bitmapData: Data(bytes), bytesPerRow: width * 4,
+      size: CGSize(width: width, height: height), format: .RGBA8, colorSpace: nil)
+  }
+
+  private func render(_ image: CIImage) -> [UInt8] {
+    var out = [UInt8](repeating: 0, count: width * height * 4)
+    context.render(
+      image, toBitmap: &out, rowBytes: width * 4, bounds: image.extent, format: .RGBA8,
+      colorSpace: nil)
+    return out
+  }
+
+  /// The spec's geometry stages, as Kotlin's `VideoEffectMath.geometry` runs
+  /// them, over the source: red, green and blue from 0 to 1 per pixel.
+  private func geometry(_ frame: VideoEffectFrame) -> [[Double]] {
+    var picture: [[Double]] = (0..<(width * height)).map { i in
+      let (r, g, b) = source(i % width, i / width)
+      return [Double(r) / 255, Double(g) / 255, Double(b) / 255]
+    }
+    func sample(_ image: [[Double]], _ px: Double, _ py: Double) -> [Double] {
+      let tx = px - 0.5
+      let ty = py - 0.5
+      let x0 = Int(tx.rounded(.down))
+      let y0 = Int(ty.rounded(.down))
+      let fx = tx - Double(x0)
+      let fy = ty - Double(y0)
+      func at(_ x: Int, _ y: Int, _ c: Int) -> Double {
+        image[min(max(y, 0), height - 1) * width + min(max(x, 0), width - 1)][c]
+      }
+      return (0..<3).map { c in
+        let top = at(x0, y0, c) + (at(x0 + 1, y0, c) - at(x0, y0, c)) * fx
+        let bottom = at(x0, y0 + 1, c) + (at(x0 + 1, y0 + 1, c) - at(x0, y0 + 1, c)) * fx
+        return top + (bottom - top) * fy
+      }
+    }
+    func stage(_ on: Bool, _ read: (Int, Int) -> (Double, Double)) {
+      guard on else { return }
+      let input = picture
+      picture = (0..<(width * height)).map { i in
+        let (px, py) = read(i % width, i / width)
+        return sample(input, px, py)
+      }
+    }
+    let w = Double(width)
+    let h = Double(height)
+    let mx = min(videoEffectPixels(frame.mirrorX, width), width / 2)
+    let my = min(videoEffectPixels(frame.mirrorY, height), height / 2)
+    let scale = 1 + max(frame.zoom, 0)
+    stage(frame.hasWave) { x, y in
+      let period = max(frame.wavePeriod, VideoEffectFrame.minWavePeriod) * h
+      let t = ((Double(y) + 0.5) / period + frame.wavePhase) * 16
+      let k = t.rounded(.down)
+      let from = sin(2 * Double.pi * k / 16)
+      let to = sin(2 * Double.pi * (k + 1) / 16)
+      let shift = frame.waveAmplitude * w * (from + (to - from) * (t - k))
+      return (Double(x) + 0.5 - shift, Double(y) + 0.5)
+    }
+    stage(frame.hasTransform) { x, y in
+      let fx = frame.mirrorX > 0 && x >= width - mx ? 2 * (width - mx) - 1 - x : x
+      let fy = frame.mirrorY > 0 && y >= height - my ? 2 * (height - my) - 1 - y : y
+      return (
+        (Double(fx) + 0.5 - w / 2 - frame.offsetX * w) / scale + w / 2,
+        (Double(fy) + 0.5 - h / 2 - frame.offsetY * h) / scale + h / 2
+      )
+    }
+    stage(frame.tiles >= 2) { x, y in
+      (
+        ((Double(x) + 0.5) * 2).truncatingRemainder(dividingBy: w),
+        ((Double(y) + 0.5) * 2).truncatingRemainder(dividingBy: h)
+      )
+    }
+    return picture
+  }
+
+  /// The spec, pixel by pixel, as Kotlin's `VideoEffectMath.apply` runs it.
+  private func reference(_ frame: VideoEffectFrame) -> [UInt8] {
+    let block = videoEffectPixels(frame.pixelSize, width)
+    let split = videoEffectPixels(frame.rgbShift, width)
+    let period = max(2, videoEffectPixels(frame.scanlinePeriod, height))
+    let cell = max(1, videoEffectPixels(frame.noiseCellSize, height))
+    let bands = frame.bands.prefix(VideoEffectFrame.maxBands).map {
+      (
+        videoEffectPixels($0.top, height), videoEffectPixels($0.bottom, height),
+        videoEffectPixels($0.shift, width)
+      )
+    }
+    let picture = geometry(frame)
+    func clamp(_ v: Int, _ high: Int) -> Int { min(max(v, 0), high) }
+    func pixelated(_ x: Int, _ y: Int) -> [Double] {
+      var sx = clamp(x, width - 1)
+      var sy = y
+      if block >= 2 {
+        sx = sx / block * block + block / 2
+        sy = sy / block * block + block / 2
+      }
+      return picture[clamp(sy, height - 1) * width + clamp(sx, width - 1)]
+    }
+    func banded(_ x: Int, _ y: Int, _ shift: Int) -> [Double] {
+      pixelated(clamp(clamp(x, width - 1) - shift, width - 1), y)
+    }
+    func toByte(_ v: Double) -> UInt8 { UInt8((min(max(v, 0), 1) * 255 + 0.5).rounded(.down)) }
+
+    var channels = [[Double]](repeating: [Double](repeating: 0, count: width * height), count: 3)
+    for y in 0..<height {
+      let shift = bands.first { y >= $0.0 && y < $0.1 }?.2 ?? 0
+      let dark = frame.scanlines > 0 && (y % period) * 2 >= period
+      for x in 0..<width {
+        let center = banded(x, y, shift)
+        var r = banded(x + split, y, shift)[0]
+        var g = center[1]
+        var b = banded(x - split, y, shift)[2]
+        if dark {
+          let keep = 1 - frame.scanlines
+          r *= keep
+          g *= keep
+          b *= keep
+        }
+        if frame.noise > 0 {
+          let u = (x / cell + frame.noiseOffsetX) % videoEffectNoiseTileSize
+          let v = (y / cell + frame.noiseOffsetY) % videoEffectNoiseTileSize
+          let grain = (videoEffectNoise(u: u, v: v) - 0.5) * frame.noise
+          r += grain
+          g += grain
+          b += grain
+        }
+        func clampAll() {
+          r = min(max(r, 0), 1)
+          g = min(max(g, 0), 1)
+          b = min(max(b, 0), 1)
+        }
+        clampAll()
+        if frame.sepia > 0 {
+          let s = frame.sepia
+          let sr = 0.393 * r + 0.769 * g + 0.189 * b
+          let sg = 0.349 * r + 0.686 * g + 0.168 * b
+          let sb = 0.272 * r + 0.534 * g + 0.131 * b
+          r += (sr - r) * s
+          g += (sg - g) * s
+          b += (sb - b) * s
+        }
+        let gain = 1 + frame.brightness
+        r *= gain
+        g *= gain
+        b *= gain
+        r += frame.invert * (1 - 2 * r)
+        g += frame.invert * (1 - 2 * g)
+        b += frame.invert * (1 - 2 * b)
+        r += frame.flash * (1 - r)
+        g += frame.flash * (1 - g)
+        b += frame.flash * (1 - b)
+        clampAll()
+        if frame.vignette > 0 {
+          let radius = min(max(frame.vignetteRadius, 0), 0.99)
+          let dx = Double(2 * x + 1) / Double(width) - 1
+          let dy = Double(2 * y + 1) / Double(height) - 1
+          let t = min(max((((dx * dx + dy * dy) / 2).squareRoot() - radius) / (1 - radius), 0), 1)
+          let keep = 1 - frame.vignette * t * t
+          r *= keep
+          g *= keep
+          b *= keep
+        }
+        clampAll()
+        channels[0][y * width + x] = r
+        channels[1][y * width + x] = g
+        channels[2][y * width + x] = b
+      }
+    }
+    if frame.glow > 0 {
+      let t = min(max(frame.glowThreshold, 0), 0.99)
+      let k = (0..<(width * height)).map { i in
+        let l = 0.2126 * channels[0][i] + 0.7152 * channels[1][i] + 0.0722 * channels[2][i]
+        return min(max((l - t) / (1 - t), 0), 1)
+      }
+      channels = channels.map { channel in
+        let bright = zip(channel, k).map { min(1, frame.glow * $1 * $0) }
+        let halo = gaussianBlur(bright, sigma: frame.glowRadius * Double(height))
+        return zip(channel, halo).map { min(max(1 - (1 - $0) * (1 - $1), 0), 1) }
+      }
+    }
+    var out = [UInt8](repeating: 255, count: width * height * 4)
+    for i in 0..<(width * height) {
+      out[i * 4] = toByte(channels[0][i])
+      out[i * 4 + 1] = toByte(channels[1][i])
+      out[i * 4 + 2] = toByte(channels[2][i])
+    }
+    return out
+  }
+
+  /// Kotlin's `VideoEffectMath.gaussianBlur`: rows, then columns, a normalized
+  /// kernel reaching `ceil(3 * sigma)` pixels, edges repeated.
+  private func gaussianBlur(_ values: [Double], sigma: Double) -> [Double] {
+    guard sigma >= 0.5 else { return values }
+    let reach = Int((3 * sigma).rounded(.up))
+    var kernel = (0...(2 * reach)).map { exp(-Double(($0 - reach) * ($0 - reach)) / (2 * sigma * sigma)) }
+    let total = kernel.reduce(0, +)
+    kernel = kernel.map { $0 / total }
+    func clamp(_ v: Int, _ high: Int) -> Int { min(max(v, 0), high) }
+    var rows = [Double](repeating: 0, count: values.count)
+    for y in 0..<height {
+      for x in 0..<width {
+        var sum = 0.0
+        for k in 0..<kernel.count { sum += kernel[k] * values[y * width + clamp(x + k - reach, width - 1)] }
+        rows[y * width + x] = sum
+      }
+    }
+    var out = [Double](repeating: 0, count: values.count)
+    for y in 0..<height {
+      for x in 0..<width {
+        var sum = 0.0
+        for k in 0..<kernel.count { sum += kernel[k] * rows[clamp(y + k - reach, height - 1) * width + x] }
+        out[y * width + x] = sum
+      }
+    }
+    return out
+  }
+
+  /// An order-sensitive hash of every red, green and blue byte.
+  private func checksum(_ pixels: [UInt8]) -> UInt32 {
+    var h: UInt32 = 0
+    for i in stride(from: 0, to: pixels.count, by: 4) {
+      for c in 0..<3 { h = h &* 31 &+ UInt32(pixels[i + c]) }
+    }
+    return h
+  }
+
+  private let goldens: [(String, VideoEffectFrame, UInt32)] = [
+    ("identity", VideoEffectFrame(), 0x8c5f_1e40),
+    ("pixelate", VideoEffectFrame(pixelSize: 0.25), 0xe43c_d600),
+    (
+      "bands and split",
+      VideoEffectFrame(
+        rgbShift: 0.1,
+        bands: [
+          VideoEffectBand(top: 0.25, bottom: 0.5, shift: 0.2),
+          VideoEffectBand(top: 0.4, bottom: 0.9, shift: -0.125),
+        ]),
+      0x5f7e_3216
+    ),
+    (
+      "scanlines and noise",
+      VideoEffectFrame(
+        scanlines: 0.4, scanlinePeriod: 0.25, noise: 0.3, noiseCellSize: 0.125,
+        noiseOffsetX: 5, noiseOffsetY: 120),
+      0x12b2_6fc6
+    ),
+    (
+      "everything",
+      VideoEffectFrame(
+        pixelSize: 0.125, rgbShift: -0.05, scanlines: 0.25, scanlinePeriod: 0.1875, noise: 0.2,
+        noiseCellSize: 0.0625, noiseOffsetX: 127, noiseOffsetY: 3,
+        bands: [
+          VideoEffectBand(top: 0, bottom: 0.3, shift: 0.5),
+          VideoEffectBand(top: 0.6, bottom: 1, shift: -0.3),
+        ]),
+      0xea95_b6e7
+    ),
+    (
+      "tones",
+      VideoEffectFrame(sepia: 0.6, brightness: -0.1, invert: 0.25, flash: 0.2),
+      0xff2a_26c6
+    ),
+    ("vignette", VideoEffectFrame(vignette: 0.8, vignetteRadius: 0.25), 0x9028_d182),
+    (
+      "old film",
+      VideoEffectFrame(
+        noise: 0.3, noiseCellSize: 0.125, noiseOffsetX: 9, noiseOffsetY: 77, sepia: 0.85,
+        brightness: -0.04, vignette: 0.6, vignetteRadius: 0.3),
+      0xcd38_dc88
+    ),
+    ("sepia overflow", VideoEffectFrame(sepia: 1, brightness: -0.3), 0x10e6_8ca5),
+    (
+      "noisy vignette",
+      VideoEffectFrame(
+        noise: 0.5, noiseCellSize: 0.0625, noiseOffsetX: 33, noiseOffsetY: 90, vignette: 0.9,
+        vignetteRadius: 0.1),
+      0xa502_43e8
+    ),
+    ("strong vignette", VideoEffectFrame(vignette: 1.5, vignetteRadius: 0.1), 0x5ade_77f4),
+    (
+      "negative over noise",
+      VideoEffectFrame(
+        noise: 0.4, noiseCellSize: 0.0625, noiseOffsetX: 64, noiseOffsetY: 1, invert: 1),
+      0x0a1d_b883
+    ),
+    (
+      "zoom and offset",
+      VideoEffectFrame(zoom: 0.3, offsetX: 0.05, offsetY: -0.03125),
+      0xd7ef_0dfc
+    ),
+    ("mirror", VideoEffectFrame(mirrorX: 0.5), 0x8eba_3800),
+    ("kaleidoscope", VideoEffectFrame(mirrorX: 0.35, mirrorY: 0.5), 0x15a0_01c0),
+    ("tiles", VideoEffectFrame(tiles: 2), 0x3271_0580),
+    ("zoomed tiles", VideoEffectFrame(zoom: 0.3, tiles: 2), 0xd3df_8920),
+    (
+      "wave",
+      VideoEffectFrame(waveAmplitude: 0.05, wavePeriod: 0.5, wavePhase: 0.125),
+      0xecd2_2b5b
+    ),
+    (
+      "zoomed wave",
+      VideoEffectFrame(zoom: 0.11, waveAmplitude: 0.05, wavePeriod: 0.5, wavePhase: 0.125),
+      0xe075_e137
+    ),
+    (
+      "backward wave",
+      VideoEffectFrame(waveAmplitude: -0.08, wavePeriod: 0.3, wavePhase: 0.9),
+      0xf1c3_cb72
+    ),
+    (
+      "geometry under everything",
+      VideoEffectFrame(
+        pixelSize: 0.125, rgbShift: 0.05, scanlines: 0.25, scanlinePeriod: 0.25,
+        bands: [VideoEffectBand(top: 0.25, bottom: 0.5, shift: 0.2)], zoom: 0.4, offsetX: 0.02,
+        offsetY: 0.01, mirrorX: 0.35, mirrorY: 0.5, tiles: 2, waveAmplitude: 0.04,
+        wavePeriod: 0.75, wavePhase: 0.4),
+      0x73ef_363b
+    ),
+  ]
+
+  /// The glow goldens, apart because Core Image's own Gaussian may differ from
+  /// the spec's by a step or two.
+  private let glowGoldens: [(String, VideoEffectFrame, UInt32)] = [
+    ("glow", VideoEffectFrame(glow: 1, glowThreshold: 0.5, glowRadius: 0.125), 0x0ccf_5e16),
+    (
+      "wide glow over tones",
+      VideoEffectFrame(
+        sepia: 0.5, brightness: 0.2, vignette: 0.8, vignetteRadius: 0.2, glow: 1.2,
+        glowThreshold: 0.3, glowRadius: 0.25),
+      0xc3ac_6681
+    ),
+    (
+      "glow without blur", VideoEffectFrame(glow: 0.8, glowThreshold: 0.6, glowRadius: 0.01),
+      0x366f_3b63
+    ),
+    (
+      "glow over a strong vignette",
+      VideoEffectFrame(
+        vignette: 1.5, vignetteRadius: 0.1, glow: 0.9, glowThreshold: 0.4, glowRadius: 0.0625),
+      0x2350_2818
+    ),
+  ]
+
+  func testReferenceMatchesTheSharedGoldens() {
+    for (name, frame, golden) in goldens + glowGoldens {
+      XCTAssertEqual(checksum(reference(frame)), golden, name)
+    }
+  }
+
+  func testCoreImageGlowStaysCloseToTheSpec() {
+    for (name, frame, _) in glowGoldens {
+      let expected = reference(frame)
+      let actual = render(applyVideoEffect(to: sourceImage(), frame))
+      var worst = 0
+      for i in 0..<expected.count where i % 4 != 3 {
+        worst = max(worst, abs(Int(expected[i]) - Int(actual[i])))
+      }
+      XCTAssertLessThanOrEqual(worst, 2, name)
+    }
+  }
+
+  func testCoreImageStageMatchesTheSpec() {
+    // An odd block exercises the other half of CIPixellate's grid offset.
+    let frames = goldens.map { ($0.0, $0.1) } + [("odd block", VideoEffectFrame(pixelSize: 0.2))]
+    // The geometry interpolates with the GPU's bilinear filtering, whose
+    // weights are rounded, so it can land one step away from the spec; the
+    // steps after it copy whole pixels and add nothing to that.
+    for (name, frame) in frames {
+      let expected = reference(frame)
+      let actual = render(applyVideoEffect(to: sourceImage(), frame))
+      for i in 0..<expected.count where i % 4 != 3 {
+        let pixel = "(\(i / 4 % width), \(i / 4 / width)) channel \(i % 4)"
+        XCTAssertLessThanOrEqual(
+          abs(Int(expected[i]) - Int(actual[i])), 1, "\(name) at \(pixel)")
+      }
+    }
+  }
+
+  func testCoreImageStageKeepsAnExtentAwayFromTheOrigin() {
+    let frame = goldens[4].1
+    let moved = sourceImage().transformed(by: CGAffineTransform(translationX: 7, y: 3))
+    let result = applyVideoEffect(to: moved, frame)
+    XCTAssertEqual(result.extent, moved.extent)
+    XCTAssertEqual(
+      render(result),
+      render(applyVideoEffect(to: sourceImage(), frame)))
+  }
+
+  func testWaveCoversEveryRow() {
+    // At this height and phase, segment boundaries worked out one segment at
+    // a time round apart and leave row 22 in no segment.
+    let w = 4
+    let h = 1080
+    let grey = CIImage(color: CIColor(red: 0.5, green: 0.5, blue: 0.5))
+      .cropped(to: CGRect(x: 0, y: 0, width: w, height: h))
+    let frame = VideoEffectFrame(waveAmplitude: 0.025, wavePeriod: 0.5, wavePhase: 1.0 / 48)
+    let result = applyVideoEffect(to: grey, frame)
+    var out = [UInt8](repeating: 0, count: w * h * 4)
+    context.render(
+      result, toBitmap: &out, rowBytes: w * 4, bounds: result.extent, format: .RGBA8,
+      colorSpace: nil)
+    for y in 0..<h {
+      XCTAssertEqual(out[y * w * 4 + 3], 255, "row \(y)")
+    }
+  }
+
+  func testFromArgumentsReadsTheTableAndPicksFramesByTime() {
+    let stride = VideoEffectFrame.stride
+    var values = [Double](repeating: 0, count: stride * 3)
+    for i in 0..<3 { values[i * stride] = Double(i) / 100 }
+    values[8] = 1
+    values[9] = 0.1
+    values[10] = 0.2
+    values[11] = -0.3
+    let data = values.withUnsafeBufferPointer { Data(buffer: $0) }
+    let effect = VideoEffectConfig.fromArguments([
+      "startUs": 1_000_000, "endUs": 2_000_000, "frameRate": 24, "stride": stride,
+      "frames": FlutterStandardTypedData(float64: data),
+    ])!
+
+    XCTAssertNil(effect.frame(atUs: 999_999))
+    XCTAssertEqual(
+      effect.frame(atUs: 1_000_000)?.bands, [VideoEffectBand(top: 0.1, bottom: 0.2, shift: -0.3)])
+    XCTAssertEqual(effect.frame(atUs: 1_041_667)?.pixelSize, 0.01)
+    // Bucket 3 wraps back to the first frame.
+    XCTAssertEqual(effect.frame(atUs: 1_125_000)?.pixelSize, 0)
+    XCTAssertNil(effect.frame(atUs: 2_000_000))
+    XCTAssertNil(VideoEffectConfig.fromArguments(["stride": 3, "frames": [1.0, 2.0, 3.0]]))
+  }
+
+  func testResolveMergesOverlappingEffectsLikeDart() {
+    let pixelate = VideoEffectFrame(pixelSize: 0.05, rgbShift: 0.01)
+    let vhs = VideoEffectFrame(
+      rgbShift: 0.006, scanlines: 0.3, scanlinePeriod: 1 / 270, noise: 0.2,
+      noiseCellSize: 1 / 540, noiseOffsetX: 9, noiseOffsetY: 4,
+      bands: [VideoEffectBand(top: 0.1, bottom: 0.2, shift: 0.01)])
+    let effects = [
+      VideoEffectConfig(startUs: nil, endUs: nil, frameRate: 24, frames: [pixelate]),
+      VideoEffectConfig(startUs: nil, endUs: 1_000, frameRate: 24, frames: [vhs]),
+    ]
+    let merged = VideoEffectConfig.resolve(effects, atUs: 0)
+    XCTAssertEqual(merged.pixelSize, 0.05)
+    XCTAssertEqual(merged.rgbShift, 0.016, accuracy: 1e-12)
+    XCTAssertEqual(merged.scanlines, 0.3)
+    XCTAssertEqual(merged.noiseOffsetX, 9)
+    XCTAssertEqual(merged.bands, vhs.bands)
+    XCTAssertEqual(VideoEffectConfig.resolve(effects, atUs: 1_000), pixelate)
+  }
+
+  func testMergeCombinesTheGeometryLikeDart() {
+    let shake = VideoEffectFrame(zoom: 0.04, offsetX: 0.01, offsetY: -0.02)
+    let split = VideoEffectFrame(zoom: 0.3, mirrorX: 0.2, tiles: 2)
+    let wave = VideoEffectFrame(waveAmplitude: -0.03, wavePeriod: 0.5, wavePhase: 0.1)
+    let weakWave = VideoEffectFrame(
+      mirrorX: 0.5, waveAmplitude: 0.01, wavePeriod: 0.9, wavePhase: 0.7)
+    let merged = shake.merged(with: split).merged(with: wave).merged(with: weakWave)
+    XCTAssertEqual(merged.zoom, 0.34, accuracy: 1e-12)
+    XCTAssertEqual(merged.offsetX, 0.01, accuracy: 1e-12)
+    XCTAssertEqual(merged.offsetY, -0.02, accuracy: 1e-12)
+    XCTAssertEqual(merged.mirrorX, 0.5)
+    XCTAssertEqual(merged.tiles, 2)
+    XCTAssertEqual(merged.waveAmplitude, -0.03)
+    XCTAssertEqual(merged.wavePeriod, 0.5)
+    XCTAssertEqual(merged.wavePhase, 0.1)
+    // A wave without a period is off, however strong.
+    let off = VideoEffectFrame(zoom: 0.1, waveAmplitude: 0.05)
+    for frame in [wave.merged(with: off), off.merged(with: wave)] {
+      XCTAssertEqual(frame.waveAmplitude, -0.03)
+      XCTAssertEqual(frame.wavePeriod, 0.5)
+      XCTAssertEqual(frame.wavePhase, 0.1)
+    }
+    XCTAssertFalse(VideoEffectFrame(tiles: 2).isIdentity)
+    XCTAssertTrue(VideoEffectFrame(tiles: 1, waveAmplitude: 0.1).isIdentity)
+  }
+
+  func testMergeCombinesTonesLikeDart() {
+    let oldFilm = VideoEffectFrame(sepia: 0.8, brightness: 0.03, vignette: 0.5, vignetteRadius: 0.3)
+    let strobe = VideoEffectFrame(brightness: -0.01, invert: 0.2, flash: 0.9)
+    let vignette = VideoEffectFrame(vignette: 0.7, vignetteRadius: 0.4)
+    let merged = oldFilm.merged(with: strobe).merged(with: vignette)
+    XCTAssertEqual(merged.sepia, 0.8)
+    XCTAssertEqual(merged.brightness, 0.02, accuracy: 1e-12)
+    XCTAssertEqual(merged.invert, 0.2)
+    XCTAssertEqual(merged.flash, 0.9)
+    XCTAssertEqual(merged.vignette, 0.7)
+    XCTAssertEqual(merged.vignetteRadius, 0.4)
+  }
+}
+
+/// The limiter that keeps a volume above 1.0 from clipping the export.
+final class VolumeLimiterTests: XCTestCase {
+
+  func testPeakLimiterLeavesMaterialUnderTheCeilingAlone() {
+    var limiter = PeakLimiter(sampleRate: 48_000)
+    XCTAssertEqual(limiter.gain(forPeak: 0.5), 1)
+  }
+
+  func testPeakLimiterTurnsAFrameThatWouldCrossDownToTheCeiling() {
+    var limiter = PeakLimiter(sampleRate: 48_000)
+    let gain = limiter.gain(forPeak: 2.7)
+    XCTAssertEqual(2.7 * gain, PeakLimiter.ceiling, accuracy: 1e-6)
+  }
+
+  func testPeakLimiterRecoversAfterAPeak() {
+    var limiter = PeakLimiter(sampleRate: 48_000)
+    _ = limiter.gain(forPeak: 2.7)
+    let rightAfter = limiter.gain(forPeak: 0.3)
+    for _ in 0..<48_000 { _ = limiter.gain(forPeak: 0.3) }
+    XCTAssertLessThan(rightAfter, 1)
+    XCTAssertEqual(limiter.gain, 1, accuracy: 1e-4)
+  }
+
+  func testPeakLimiterLiftsTheGainWhenTheVolumeDrops() {
+    var limiter = PeakLimiter(sampleRate: 48_000)
+    let gain = limiter.gain(forPeak: 2.7)
+    limiter.volumeDropped(by: 1.5)
+    XCTAssertEqual(limiter.gain, gain * 1.5, accuracy: 1e-6)
+    limiter.volumeDropped(by: 10)
+    XCTAssertEqual(limiter.gain, 1)
+  }
+
+  func testVolumeScheduleReadsTheVolumeSetAtATime() {
+    func range(_ start: Double, _ end: Double) -> CMTimeRange {
+      CMTimeRange(
+        start: CMTime(seconds: start, preferredTimescale: 600),
+        end: CMTime(seconds: end, preferredTimescale: 600))
+    }
+    // Out of order, with a gap from 1 s to 2 s.
+    let schedule = VolumeSchedule([(range(2, 3), 0.5), (range(0.5, 1), 3)])
+    XCTAssertEqual(schedule.volume(at: 0.25), 1)
+    XCTAssertEqual(schedule.volume(at: 0.75), 3)
+    // A mix holds a volume through a gap.
+    XCTAssertEqual(schedule.volume(at: 1.5), 3)
+    XCTAssertEqual(schedule.volume(at: 2.5), 0.5)
+    XCTAssertTrue(schedule.amplifies)
+    XCTAssertFalse(VolumeSchedule(constant: 1).amplifies)
+    XCTAssertNil(AudioMixTap.make(volumes: VolumeSchedule(constant: 0.8)))
+  }
+
+  /// A loud tone exported at volume 3 used to leave the encoder clipped on
+  /// most of its samples.
+  func testExportLimitsATrackPlayedAboveItsOwnLevel() throws {
+    let directory = FileManager.default.temporaryDirectory
+      .appendingPathComponent("limiter-\(UUID().uuidString)")
+    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let source = directory.appendingPathComponent("tone.caf")
+    let format = AVAudioFormat(standardFormatWithSampleRate: 44_100, channels: 2)!
+    let tone = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: 44_100)!
+    tone.frameLength = 44_100
+    for channel in 0..<2 {
+      for frame in 0..<44_100 {
+        tone.floatChannelData![channel][frame] = 0.8 * sin(Float(frame) * 2 * .pi * 440 / 44_100)
+      }
+    }
+    try AVAudioFile(forWriting: source, settings: format.settings).write(from: tone)
+
+    let asset = AVURLAsset(url: source)
+    let track = try XCTUnwrap(asset.tracks(withMediaType: .audio).first)
+    let parameters = AVMutableAudioMixInputParameters(track: track)
+    parameters.setVolume(3, at: .zero)
+    parameters.audioTapProcessor = AudioMixTap.make(volumes: VolumeSchedule(constant: 3))
+    let mix = AVMutableAudioMix()
+    mix.inputParameters = [parameters]
+    let output = directory.appendingPathComponent("limited.m4a")
+    let export = try XCTUnwrap(
+      AVAssetExportSession(asset: asset, presetName: AVAssetExportPresetAppleM4A))
+    export.audioMix = mix
+    export.outputURL = output
+    export.outputFileType = .m4a
+    let exported = expectation(description: "export finished")
+    export.exportAsynchronously { exported.fulfill() }
+    wait(for: [exported], timeout: 30)
+    XCTAssertEqual(export.status, .completed, String(describing: export.error))
+
+    let file = try AVAudioFile(forReading: output)
+    let read = AVAudioPCMBuffer(
+      pcmFormat: file.processingFormat, frameCapacity: AVAudioFrameCount(file.length))!
+    try file.read(into: read)
+    var peak: Float = 0
+    for frame in 0..<Int(read.frameLength) {
+      peak = max(peak, abs(read.floatChannelData![0][frame]))
+    }
+    // Louder than the source, but under full scale: limited, not clipped.
+    XCTAssertGreaterThan(peak, 0.8)
+    XCTAssertLessThan(peak, 0.99)
+  }
+
+  /// Three 0.5 s clips at volumes 1, 3 and 1. Given one flat ramp per clip,
+  /// the mix faded from each volume to the next across the whole clip, so the
+  /// loud clip started quiet and the one after it played loud and unlimited.
+  func testVolumeStepsSwitchAtEachCutAndLimitOnlyTheLoudClip() throws {
+    let directory = FileManager.default.temporaryDirectory
+      .appendingPathComponent("limiter-\(UUID().uuidString)")
+    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let source = directory.appendingPathComponent("tone.caf")
+    let clipFrames = 22_050
+    let format = AVAudioFormat(standardFormatWithSampleRate: 44_100, channels: 2)!
+    let tone = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: AVAudioFrameCount(clipFrames))!
+    tone.frameLength = AVAudioFrameCount(clipFrames)
+    for channel in 0..<2 {
+      for frame in 0..<clipFrames {
+        tone.floatChannelData![channel][frame] = 0.5 * sin(Float(frame) * 2 * .pi * 440 / 44_100)
+      }
+    }
+    try AVAudioFile(forWriting: source, settings: format.settings).write(from: tone)
+
+    let asset = AVURLAsset(url: source)
+    let sourceTrack = try XCTUnwrap(asset.tracks(withMediaType: .audio).first)
+    let composition = AVMutableComposition()
+    let track = try XCTUnwrap(
+      composition.addMutableTrack(
+        withMediaType: .audio, preferredTrackID: kCMPersistentTrackID_Invalid))
+    let clip = CMTime(value: CMTimeValue(clipFrames), timescale: 44_100)
+    var steps: [(range: CMTimeRange, volume: Float)] = []
+    for (index, volume) in [Float(1), 3, 1].enumerated() {
+      let start = CMTimeMultiply(clip, multiplier: Int32(index))
+      try track.insertTimeRange(
+        CMTimeRange(start: .zero, duration: clip), of: sourceTrack, at: start)
+      steps.append((CMTimeRange(start: start, duration: clip), volume))
+    }
+    let parameters = AVMutableAudioMixInputParameters(track: track)
+    parameters.setVolumeSteps(steps)
+    let mix = AVMutableAudioMix()
+    mix.inputParameters = [parameters]
+
+    // Read the mix as float through an asset reader, the bitrate-capped
+    // export's path, so nothing clips or codes the level on the way out.
+    let reader = try AVAssetReader(asset: composition)
+    let output = AVAssetReaderAudioMixOutput(
+      audioTracks: [track],
+      audioSettings: [
+        AVFormatIDKey: kAudioFormatLinearPCM,
+        AVSampleRateKey: 44_100,
+        AVNumberOfChannelsKey: 2,
+        AVLinearPCMBitDepthKey: 32,
+        AVLinearPCMIsFloatKey: true,
+        AVLinearPCMIsBigEndianKey: false,
+        AVLinearPCMIsNonInterleaved: false,
+      ])
+    output.audioMix = mix
+    reader.add(output)
+    XCTAssertTrue(reader.startReading())
+    var left: [Float] = []
+    while let buffer = output.copyNextSampleBuffer(),
+      let block = CMSampleBufferGetDataBuffer(buffer)
+    {
+      var interleaved = [Float](repeating: 0, count: CMBlockBufferGetDataLength(block) / 4)
+      CMBlockBufferCopyDataBytes(
+        block, atOffset: 0, dataLength: interleaved.count * 4, destination: &interleaved)
+      left += stride(from: 0, to: interleaved.count, by: 2).map { interleaved[$0] }
+    }
+    XCTAssertEqual(reader.status, .completed, String(describing: reader.error))
+
+    /// The lowest and highest peak of each 440 Hz cycle from [from] to [to] s.
+    func level(_ from: Double, _ to: Double) -> (low: Float, high: Float) {
+      var peaks: [Float] = []
+      var start = Int(from * 44_100)
+      while start + 101 <= min(Int(to * 44_100), left.count) {
+        peaks.append(left[start..<start + 101].map(abs).max()!)
+        start += 101
+      }
+      return (peaks.min() ?? 0, peaks.max() ?? 0)
+    }
+    // The quiet clips keep their level, also right after the loud one.
+    let first = level(0.05, 0.49)
+    XCTAssertEqual(first.low, 0.5, accuracy: 0.005)
+    XCTAssertEqual(first.high, 0.5, accuracy: 0.005)
+    let last = level(1.1, 1.5)
+    XCTAssertEqual(last.low, 0.5, accuracy: 0.005)
+    XCTAssertEqual(last.high, 0.5, accuracy: 0.005)
+    // The loud clip is at the ceiling from early on, and nothing passes it.
+    let loud = level(0.6, 0.99)
+    XCTAssertEqual(loud.low, PeakLimiter.ceiling, accuracy: 0.005)
+    XCTAssertLessThanOrEqual(left.map(abs).max() ?? 0, PeakLimiter.ceiling + 0.005)
+  }
+}
+
+/// The low shelves, peaks and high shelves a clip's or a track's equalizer
+/// applies, in order.
+final class EqualizerTests: XCTestCase {
+  typealias Band = AudioEqualizer.Band
+
+  /// The literals every twin pins: the Android export's and both of
+  /// `divine_video_player`'s. A formula that drifts on one platform makes the
+  /// editor preview stop sounding like the export.
+  func testLowShelfCoefficientsMatchTheCookbookValuesEveryTwinPins() {
+    let biquad = Biquad.lowShelf(frequencyHz: 200, gainDb: 6, sampleRate: 48_000)
+    XCTAssertEqual(biquad.b0, 1.0064455778511419, accuracy: 1e-12)
+    XCTAssertEqual(biquad.b1, -1.9686123523200318, accuracy: 1e-12)
+    XCTAssertEqual(biquad.b2, 0.9631200582728409, accuracy: 1e-12)
+    XCTAssertEqual(biquad.a1, -1.9688501073857254, accuracy: 1e-12)
+    XCTAssertEqual(biquad.a2, 0.9693278810582894, accuracy: 1e-12)
+  }
+
+  func testHighShelfCoefficientsMatchTheCookbookValuesEveryTwinPins() {
+    let biquad = Biquad.highShelf(frequencyHz: 3000, gainDb: 6, sampleRate: 48_000)
+    XCTAssertEqual(biquad.b0, 1.815113185412132, accuracy: 1e-12)
+    XCTAssertEqual(biquad.b1, -2.790024630355969, accuracy: 1e-12)
+    XCTAssertEqual(biquad.b2, 1.13571665291146, accuracy: 1e-12)
+    XCTAssertEqual(biquad.a1, -1.358218880923325, accuracy: 1e-12)
+    XCTAssertEqual(biquad.a2, 0.519024088890948, accuracy: 1e-12)
+  }
+
+  func testPeakCoefficientsMatchTheCookbookValuesEveryTwinPins() {
+    let boost = Biquad.peak(
+      frequencyHz: 1000, gainDb: 6, q: 0.7071067811865475, sampleRate: 48_000)
+    XCTAssertEqual(boost.b0, 1.0610424252634374, accuracy: 1e-12)
+    XCTAssertEqual(boost.b1, -1.8612731439964758, accuracy: 1e-12)
+    XCTAssertEqual(boost.b2, 0.816291571321481, accuracy: 1e-12)
+    XCTAssertEqual(boost.a1, -1.8612731439964758, accuracy: 1e-12)
+    XCTAssertEqual(boost.a2, 0.8773339965849185, accuracy: 1e-12)
+
+    let cut = Biquad.peak(
+      frequencyHz: 250, gainDb: -6, q: 0.7071067811865475, sampleRate: 44_100)
+    XCTAssertEqual(cut.b0, 0.9828670212502347, accuracy: 1e-12)
+    XCTAssertEqual(cut.b1, -1.930079966863433, accuracy: 1e-12)
+    XCTAssertEqual(cut.b2, 0.9484379496535652, accuracy: 1e-12)
+    XCTAssertEqual(cut.a1, -1.930079966863433, accuracy: 1e-12)
+    XCTAssertEqual(cut.a2, 0.9313049709037998, accuracy: 1e-12)
+  }
+
+  func testABandWithoutGainIsTheIdentitySection() {
+    for kind in [Band.Kind.lowShelf, .peak, .highShelf] {
+      let band = Band(kind: kind, frequencyHz: 1000, gainDb: 0, q: 2)
+      XCTAssertEqual(Biquad.forBand(band, sampleRate: 48_000), .identity, "\(kind)")
+    }
+  }
+
+  func testBuildsEachBandWithTheSectionOfItsKind() {
+    XCTAssertEqual(
+      Biquad.forBand(Band(kind: .peak, frequencyHz: 1000, gainDb: 6, q: 3), sampleRate: 48_000),
+      Biquad.peak(frequencyHz: 1000, gainDb: 6, q: 3, sampleRate: 48_000))
+    XCTAssertEqual(
+      Biquad.forBand(Band(kind: .lowShelf, frequencyHz: 200, gainDb: 6), sampleRate: 48_000),
+      Biquad.lowShelf(frequencyHz: 200, gainDb: 6, sampleRate: 48_000))
+    XCTAssertEqual(
+      Biquad.forBand(Band(kind: .highShelf, frequencyHz: 3000, gainDb: 6), sampleRate: 48_000),
+      Biquad.highShelf(frequencyHz: 3000, gainDb: 6, sampleRate: 48_000))
+  }
+
+  func testRaisingALowShelfLiftsLowTonesAndLeavesHighOnesAlone() {
+    let equalizer = single(.lowShelf, 200, 6)
+    XCTAssertEqual(gainDb(equalizer, frequency: 40), 6, accuracy: 0.2)
+    XCTAssertEqual(gainDb(equalizer, frequency: 200), 3, accuracy: 0.2)
+    XCTAssertEqual(gainDb(equalizer, frequency: 5000), 0, accuracy: 0.2)
+  }
+
+  func testRaisingAHighShelfLiftsHighTonesAndLeavesLowOnesAlone() {
+    let equalizer = single(.highShelf, 3000, 6)
+    XCTAssertEqual(gainDb(equalizer, frequency: 14_000), 6, accuracy: 0.4)
+    XCTAssertEqual(gainDb(equalizer, frequency: 60), 0, accuracy: 0.2)
+  }
+
+  func testAPeakMovesAToneAtItsFrequencyByItsGainAndLeavesDistantOnesAlone() {
+    let boost = single(.peak, 1000, 6)
+    XCTAssertEqual(gainDb(boost, frequency: 1000), 6, accuracy: 0.1)
+    XCTAssertEqual(gainDb(boost, frequency: 125), 0, accuracy: 0.3)
+    XCTAssertEqual(gainDb(boost, frequency: 8000), 0, accuracy: 0.3)
+
+    let narrow = single(.peak, 1000, 6, q: 4)
+    XCTAssertEqual(gainDb(narrow, frequency: 1000), 6, accuracy: 0.1)
+    XCTAssertLessThan(gainDb(narrow, frequency: 2000), 0.5)
+    XCTAssertGreaterThan(gainDb(boost, frequency: 2000), 2.5)
+  }
+
+  func testACascadeMovesEachToneByTheSumOfItsBands() {
+    let bands = [
+      Band(kind: .lowShelf, frequencyHz: 200, gainDb: 6),
+      Band(kind: .peak, frequencyHz: 1000, gainDb: -9, q: 2),
+      Band(kind: .highShelf, frequencyHz: 3000, gainDb: 4),
+      Band(kind: .peak, frequencyHz: 60, gainDb: 3),
+    ]
+    let cascade = AudioEqualizer(bands: bands)
+    for frequency in [60.0, 400, 1000, 2500, 12_000] {
+      let sum = bands.map { gainDb(AudioEqualizer(bands: [$0]), frequency: frequency) }
+        .reduce(0, +)
+      XCTAssertEqual(gainDb(cascade, frequency: frequency), sum, accuracy: 0.05, "\(frequency) Hz")
+    }
+    // The shelf and the 60 Hz peak add up below; the cut dominates at 1 kHz.
+    XCTAssertEqual(gainDb(cascade, frequency: 60), 9, accuracy: 0.5)
+    XCTAssertEqual(gainDb(cascade, frequency: 1000), -9, accuracy: 0.5)
+  }
+
+  func testParsesEveryBandInOrder() {
+    let bands: [[String: Any]] = [
+      ["type": "lowShelf", "frequencyHz": 120, "gainDb": 4.5, "q": 0.7],
+      ["type": "peak", "frequencyHz": 2500.0, "gainDb": -3, "q": 1.4],
+      ["type": "highShelf", "frequencyHz": 8000.0, "gainDb": 2.0],
+    ]
+    let equalizer = AudioEqualizer.from(["bands": bands])
+    XCTAssertEqual(
+      equalizer,
+      AudioEqualizer(bands: [
+        Band(kind: .lowShelf, frequencyHz: 120, gainDb: 4.5, q: 0.7),
+        Band(kind: .peak, frequencyHz: 2500, gainDb: -3, q: 1.4),
+        Band(kind: .highShelf, frequencyHz: 8000, gainDb: 2),
+      ]))
+  }
+
+  func testParsingSkipsBadBandsAndDefaultsQ() {
+    let bands: [Any] = [
+      ["type": "notch", "frequencyHz": 1000.0, "gainDb": 3.0] as [String: Any],
+      ["type": "peak", "frequencyHz": 0, "gainDb": 3.0] as [String: Any],
+      ["type": "peak", "frequencyHz": -40.0, "gainDb": 3.0] as [String: Any],
+      ["type": "peak", "gainDb": 3.0] as [String: Any],
+      ["type": "peak", "frequencyHz": 1000.0, "gainDb": Double.nan] as [String: Any],
+      ["type": "lowShelf", "frequencyHz": 200.0, "gainDb": Double.infinity] as [String: Any],
+      "not a band",
+      ["type": "peak", "frequencyHz": 1000.0, "gainDb": 3.0, "q": 0] as [String: Any],
+      ["type": "highShelf", "frequencyHz": 3000.0, "gainDb": -6.0] as [String: Any],
+    ]
+    let equalizer = AudioEqualizer.from(["bands": bands])
+    XCTAssertEqual(
+      equalizer,
+      AudioEqualizer(bands: [
+        Band(kind: .peak, frequencyHz: 1000, gainDb: 3),
+        Band(kind: .highShelf, frequencyHz: 3000, gainDb: -6),
+      ]))
+    XCTAssertEqual(Band.defaultQ, 1 / 2.0.squareRoot(), accuracy: 1e-15)
+  }
+
+  func testParsingDropsAnAbsentOrFlatEqualizer() {
+    XCTAssertNil(AudioEqualizer.from(nil))
+    XCTAssertNil(AudioEqualizer.from(["bassGainDb": 6]))
+    XCTAssertNil(AudioEqualizer.from(["bands": [Any]()]))
+    let flat: [[String: Any]] = [
+      ["type": "lowShelf", "frequencyHz": 200.0, "gainDb": 0],
+      ["type": "peak", "frequencyHz": 1000.0],
+    ]
+    XCTAssertNil(AudioEqualizer.from(["bands": flat]))
+  }
+
+  func testBoostsOnlyWhileABandRaisesTheAudio() {
+    let cut = Band(kind: .lowShelf, frequencyHz: 200, gainDb: -6)
+    let boost = Band(kind: .peak, frequencyHz: 1000, gainDb: 2)
+    XCTAssertTrue(AudioEqualizer(bands: [cut, boost]).boosts)
+    XCTAssertFalse(AudioEqualizer(bands: [cut]).boosts)
+    XCTAssertFalse(AudioEqualizer(bands: [cut]).isFlat)
+    XCTAssertTrue(AudioEqualizer().isFlat)
+  }
+
+  func testEqualizerScheduleReadsTheEntryInEffectAtATime() {
+    func range(_ start: Double, _ end: Double) -> CMTimeRange {
+      CMTimeRange(
+        start: CMTime(seconds: start, preferredTimescale: 600),
+        end: CMTime(seconds: end, preferredTimescale: 600))
+    }
+    let bass = single(.lowShelf, 200, 6)
+    let schedule = EqualizerSchedule([(range(1, 2), nil), (range(0, 1), bass)])
+    XCTAssertNil(schedule.entryIndex(at: -0.5))
+    XCTAssertEqual(schedule.entries[schedule.entryIndex(at: 0.5)!].equalizer, bass)
+    XCTAssertNil(schedule.entries[schedule.entryIndex(at: 1.5)!].equalizer)
+    XCTAssertFalse(schedule.isFlat)
+    XCTAssertTrue(EqualizerSchedule.flat.isFlat)
+    XCTAssertTrue(EqualizerSchedule(constant: single(.peak, 1000, 0)).isFlat)
+  }
+
+  func testATapIsMadeForAnEqualizerEvenWithoutAmplifying() {
+    XCTAssertNotNil(
+      AudioMixTap.make(
+        volumes: VolumeSchedule(constant: 1),
+        equalizers: EqualizerSchedule(constant: single(.highShelf, 3000, -3))))
+    XCTAssertNil(
+      AudioMixTap.make(
+        volumes: VolumeSchedule(constant: 1),
+        equalizers: EqualizerSchedule(constant: AudioEqualizer())))
+  }
+
+  /// A bitrate cap used to remux a lone, untouched clip as it was, which left
+  /// its equalizer out of the export.
+  func testAnEqualizedClipIsNotRemuxedPastItsEqualizer() throws {
+    func config(_ clip: [String: Any]) throws -> RenderConfig {
+      try XCTUnwrap(
+        RenderConfig.fromArguments([
+          "videoClips": [clip.merging(["inputPath": "/tmp/clip.mp4"]) { $1 }],
+          "outputPath": "/tmp/out.mp4",
+          "outputFormat": "mp4",
+          "enableAudio": true,
+        ]))
+    }
+    XCTAssertTrue(BitrateCapPolicy.isPassthroughEligible(try config([:])))
+    let bass: [String: Any] = [
+      "bands": [["type": "lowShelf", "frequencyHz": 200.0, "gainDb": 6.0]]
+    ]
+    XCTAssertFalse(BitrateCapPolicy.isPassthroughEligible(try config(["equalizer": bass])))
+  }
+
+  /// Three 0.5 s clips of a 60 Hz tone in one track, equalized flat, with a
+  /// 200 Hz low shelf 12 dB up, and with it 12 dB down: each clip's own
+  /// equalizer applies over its own range, and only the boost is limited.
+  func testEachClipInASharedTrackPlaysThroughItsOwnEqualizer() throws {
+    let directory = FileManager.default.temporaryDirectory
+      .appendingPathComponent("equalizer-\(UUID().uuidString)")
+    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let source = directory.appendingPathComponent("tone.caf")
+    let clipFrames = 22_050
+    let format = AVAudioFormat(standardFormatWithSampleRate: 44_100, channels: 2)!
+    let tone = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: AVAudioFrameCount(clipFrames))!
+    tone.frameLength = AVAudioFrameCount(clipFrames)
+    for channel in 0..<2 {
+      for frame in 0..<clipFrames {
+        tone.floatChannelData![channel][frame] = 0.1 * sin(Float(frame) * 2 * .pi * 60 / 44_100)
+      }
+    }
+    try AVAudioFile(forWriting: source, settings: format.settings).write(from: tone)
+
+    let asset = AVURLAsset(url: source)
+    let sourceTrack = try XCTUnwrap(asset.tracks(withMediaType: .audio).first)
+    let composition = AVMutableComposition()
+    let track = try XCTUnwrap(
+      composition.addMutableTrack(
+        withMediaType: .audio, preferredTrackID: kCMPersistentTrackID_Invalid))
+    let clip = CMTime(value: CMTimeValue(clipFrames), timescale: 44_100)
+    let equalizers: [AudioEqualizer?] = [
+      nil, single(.lowShelf, 200, 12), single(.lowShelf, 200, -12),
+    ]
+    var steps: [(range: CMTimeRange, volume: Float)] = []
+    var schedule: [(range: CMTimeRange, equalizer: AudioEqualizer?)] = []
+    for (index, equalizer) in equalizers.enumerated() {
+      let start = CMTimeMultiply(clip, multiplier: Int32(index))
+      try track.insertTimeRange(
+        CMTimeRange(start: .zero, duration: clip), of: sourceTrack, at: start)
+      steps.append((CMTimeRange(start: start, duration: clip), 1))
+      schedule.append((CMTimeRange(start: start, duration: clip), equalizer))
+    }
+    let parameters = AVMutableAudioMixInputParameters(track: track)
+    parameters.setVolumeSteps(steps, equalizers: EqualizerSchedule(schedule))
+    let mix = AVMutableAudioMix()
+    mix.inputParameters = [parameters]
+
+    let reader = try AVAssetReader(asset: composition)
+    let output = AVAssetReaderAudioMixOutput(
+      audioTracks: [track],
+      audioSettings: [
+        AVFormatIDKey: kAudioFormatLinearPCM,
+        AVSampleRateKey: 44_100,
+        AVNumberOfChannelsKey: 2,
+        AVLinearPCMBitDepthKey: 32,
+        AVLinearPCMIsFloatKey: true,
+        AVLinearPCMIsBigEndianKey: false,
+        AVLinearPCMIsNonInterleaved: false,
+      ])
+    output.audioMix = mix
+    reader.add(output)
+    XCTAssertTrue(reader.startReading())
+    var left: [Float] = []
+    while let buffer = output.copyNextSampleBuffer(),
+      let block = CMSampleBufferGetDataBuffer(buffer)
+    {
+      var interleaved = [Float](repeating: 0, count: CMBlockBufferGetDataLength(block) / 4)
+      CMBlockBufferCopyDataBytes(
+        block, atOffset: 0, dataLength: interleaved.count * 4, destination: &interleaved)
+      left += stride(from: 0, to: interleaved.count, by: 2).map { interleaved[$0] }
+    }
+    XCTAssertEqual(reader.status, .completed, String(describing: reader.error))
+
+    func peak(_ from: Double, _ to: Double) -> Float {
+      left[Int(from * 44_100)..<min(Int(to * 44_100), left.count)].map(abs).max() ?? 0
+    }
+    // 0.1 through each shelf at 60 Hz: unchanged, x3.92 and x0.255, measured
+    // after each clip's filters settle.
+    XCTAssertEqual(peak(0.1, 0.49), 0.1, accuracy: 0.002)
+    XCTAssertEqual(peak(0.65, 0.99), 0.392, accuracy: 0.01)
+    XCTAssertEqual(peak(1.15, 1.49), 0.0255, accuracy: 0.002)
+  }
+
+  /// A time-scaled track stamps its buffers a sample or two off where the one
+  /// before ended. The tap took each of those for a seek and started its
+  /// filters over, a click at every buffer of a clip at a speed like 1.1.
+  func testATimeScaledTrackPlaysThroughItsEqualizerWithoutClicks() throws {
+    let directory = FileManager.default.temporaryDirectory
+      .appendingPathComponent("equalizer-\(UUID().uuidString)")
+    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let source = directory.appendingPathComponent("tone.caf")
+    let frames = 88_200
+    let format = AVAudioFormat(standardFormatWithSampleRate: 44_100, channels: 2)!
+    let tone = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: AVAudioFrameCount(frames))!
+    tone.frameLength = AVAudioFrameCount(frames)
+    for channel in 0..<2 {
+      for frame in 0..<frames {
+        tone.floatChannelData![channel][frame] = 0.1 * sin(Float(frame) * 2 * .pi * 60 / 44_100)
+      }
+    }
+    try AVAudioFile(forWriting: source, settings: format.settings).write(from: tone)
+    let asset = AVURLAsset(url: source)
+    let sourceTrack = try XCTUnwrap(asset.tracks(withMediaType: .audio).first)
+    let length = CMTime(value: CMTimeValue(frames), timescale: 44_100)
+
+    for speed in [0.8, 1.1, 1.3] {
+      let composition = AVMutableComposition()
+      let track = try XCTUnwrap(
+        composition.addMutableTrack(
+          withMediaType: .audio, preferredTrackID: kCMPersistentTrackID_Invalid))
+      try track.insertTimeRange(
+        CMTimeRange(start: .zero, duration: length), of: sourceTrack, at: .zero)
+      track.scaleTimeRange(
+        CMTimeRange(start: .zero, duration: length),
+        toDuration: CMTimeMultiplyByFloat64(length, multiplier: 1 / speed))
+      let parameters = AVMutableAudioMixInputParameters(track: track)
+      parameters.setVolumeSteps(
+        [(CMTimeRange(start: .zero, duration: track.timeRange.duration), 1)],
+        equalizers: EqualizerSchedule(constant: single(.lowShelf, 200, 12)))
+      let mix = AVMutableAudioMix()
+      mix.inputParameters = [parameters]
+
+      let reader = try AVAssetReader(asset: composition)
+      let output = AVAssetReaderAudioMixOutput(
+        audioTracks: [track],
+        audioSettings: [
+          AVFormatIDKey: kAudioFormatLinearPCM,
+          AVSampleRateKey: 44_100,
+          AVNumberOfChannelsKey: 2,
+          AVLinearPCMBitDepthKey: 32,
+          AVLinearPCMIsFloatKey: true,
+          AVLinearPCMIsBigEndianKey: false,
+          AVLinearPCMIsNonInterleaved: false,
+        ])
+      output.audioMix = mix
+      reader.add(output)
+      XCTAssertTrue(reader.startReading())
+      var left: [Float] = []
+      while let buffer = output.copyNextSampleBuffer(),
+        let block = CMSampleBufferGetDataBuffer(buffer)
+      {
+        var interleaved = [Float](repeating: 0, count: CMBlockBufferGetDataLength(block) / 4)
+        CMBlockBufferCopyDataBytes(
+          block, atOffset: 0, dataLength: interleaved.count * 4, destination: &interleaved)
+        left += stride(from: 0, to: interleaved.count, by: 2).map { interleaved[$0] }
+      }
+      XCTAssertEqual(reader.status, .completed, String(describing: reader.error))
+      XCTAssertGreaterThan(left.count, 22_050, "speed \(speed)")
+
+      // The equalized 60 Hz tone at 0.39 moves at most 0.0034 per sample; a
+      // filter started over mid-tone jumps by up to 0.3. Past the first 50 ms,
+      // where the filters settle.
+      let steps = (2_205..<(left.count - 1)).map { abs(left[$0 + 1] - left[$0]) }
+      XCTAssertLessThan(steps.max() ?? 0, 0.005, "speed \(speed)")
+    }
+  }
+
+  private func single(
+    _ kind: Band.Kind, _ frequencyHz: Double, _ gainDb: Double, q: Double = Band.defaultQ
+  ) -> AudioEqualizer {
+    AudioEqualizer(bands: [Band(kind: kind, frequencyHz: frequencyHz, gainDb: gainDb, q: q)])
+  }
+
+  /// The gain of [equalizer] on a sine at [frequency], after it settles.
+  private func gainDb(_ equalizer: AudioEqualizer, frequency: Double) -> Double {
+    let sampleRate = 48_000.0
+    let filters = BandEqualizer(equalizer: equalizer, sampleRate: sampleRate, channelCount: 1)
+    var input: [Float] = (0..<48_000).map {
+      Float(0.25 * sin(2 * Double.pi * frequency * Double($0) / sampleRate))
+    }
+    let original = input
+    filters.process(interleaved: &input)
+    func rms(_ samples: [Float]) -> Double {
+      let settled = samples[24_000...]
+      return (settled.reduce(0) { $0 + Double($1) * Double($1) } / Double(settled.count))
+        .squareRoot()
+    }
+    return 20 * log10(rms(input) / rms(original))
+  }
+}
+
+/// A renderer that leaves the frame as it is and asks for fixed offsets.
+private final class OffsetsOnlyRenderer: CustomVideoEffectRenderer {
+  let historyOffsetsUs: [Int64]
+  init(_ offsets: [Int64]) { historyOffsetsUs = offsets }
+  func render(_ frame: CustomVideoEffectFrame) -> CIImage { frame.image }
+}
+
+class CustomVideoEffectTests: XCTestCase {
+  private var assets: [AVURLAsset] = []
+
+  private func config(_ id: String) -> CustomVideoEffectConfig {
+    CustomVideoEffectConfig(id: id, params: [:], startUs: nil, endUs: nil)
+  }
+
+  /// A composition track holding one clip per speed back to back, each the
+  /// first two seconds of a video played at that speed, and one instruction
+  /// per clip.
+  private func composition(speeds: [Double]) async throws -> (
+    AVMutableComposition, CMPersistentTrackID, [AVVideoCompositionInstructionProtocol]
+  ) {
+    let composition = AVMutableComposition()
+    let track = composition.addMutableTrack(
+      withMediaType: .video, preferredTrackID: kCMPersistentTrackID_Invalid)!
+    var instructions: [AVVideoCompositionInstructionProtocol] = []
+    var start = CMTime.zero
+    for speed in speeds {
+      let url = try ThumbnailTimestampFixture.makeColorVideo(
+        colors: [(200, 40, 40), (40, 200, 40), (40, 40, 200)])
+      // A track cannot be inserted once its asset is gone.
+      let asset = AVURLAsset(url: url)
+      assets.append(asset)
+      let source = try await asset.loadTracks(withMediaType: .video)[0]
+      let range = CMTimeRange(start: .zero, duration: CMTime(value: 2, timescale: 1))
+      try track.insertTimeRange(range, of: source, at: start)
+      var duration = range.duration
+      if speed != 1 {
+        duration = CMTimeMultiplyByFloat64(duration, multiplier: 1 / speed)
+        track.scaleTimeRange(CMTimeRange(start: start, duration: range.duration), toDuration: duration)
+      }
+      instructions.append(
+        CustomVideoCompositionInstruction(
+          timeRange: CMTimeRange(start: start, duration: duration),
+          sourceTrackID: track.trackID,
+          layerInstructions: []))
+      start = start + duration
+    }
+    return (composition, track.trackID, instructions)
+  }
+
+  /// The non-empty segments of `track` as (target start, target end, source
+  /// start, source end) in seconds.
+  private func spans(of track: AVCompositionTrack) -> [[Double]] {
+    track.segments.filter { !$0.isEmpty }.map {
+      let t = $0.timeMapping.target
+      let s = $0.timeMapping.source
+      return [t.start.seconds, CMTimeRangeGetEnd(t).seconds, s.start.seconds, CMTimeRangeGetEnd(s).seconds]
+    }
+  }
+
+  private func assertSpans(
+    _ actual: [[Double]], _ expected: [[Double]], file: StaticString = #filePath, line: UInt = #line
+  ) {
+    XCTAssertEqual(actual.count, expected.count, "\(actual)", file: file, line: line)
+    for (a, e) in zip(actual, expected) {
+      for (x, y) in zip(a, e) {
+        XCTAssertEqual(x, y, accuracy: 0.001, "\(actual)", file: file, line: line)
+      }
+    }
+  }
+
+  func testTheDelayedCopyRepeatsEachClipWithinItselfOnly() async throws {
+    let (composition, trackID, instructions) = try await composition(speeds: [1, 1])
+    let stage = CustomVideoEffectStage(
+      config: config("test"), renderer: OffsetsOnlyRenderer([100_000]))
+
+    let updated = try await applyCustomVideoEffectHistory(
+      stages: [stage], composition: composition, videoTrackID: trackID,
+      instructions: instructions)
+
+    let delayed = composition.track(withTrackID: stage.historyTrackIDs[0])!
+    // Clip 2 starts at 2 s: the copy is empty for its first 100 ms instead of
+    // carrying clip 1 over the cut.
+    assertSpans(spans(of: delayed), [[0.1, 2.0, 0.0, 1.9], [2.1, 4.0, 0.0, 1.9]])
+    XCTAssertEqual(delayed.timeRange.end.seconds, 4.0, accuracy: 0.001)
+
+    let first = updated[0] as! CustomVideoCompositionInstruction
+    XCTAssertEqual(first.primaryTrackID, trackID)
+    XCTAssertEqual(first.historyTrackIDs, [stage.historyTrackIDs[0]])
+    XCTAssertEqual(
+      first.requiredSourceTrackIDs?.map { ($0 as! NSNumber).int32Value },
+      [trackID, stage.historyTrackIDs[0]])
+  }
+
+  func testTheOffsetIsMeasuredOnTheSpedUpClip() async throws {
+    // At 2x the clip lasts 1 s and the copy 100 ms behind it shows the source
+    // 200 ms behind.
+    let (composition, trackID, instructions) = try await composition(speeds: [2])
+    let stage = CustomVideoEffectStage(
+      config: config("test"), renderer: OffsetsOnlyRenderer([100_000]))
+
+    _ = try await applyCustomVideoEffectHistory(
+      stages: [stage], composition: composition, videoTrackID: trackID,
+      instructions: instructions)
+
+    let delayed = composition.track(withTrackID: stage.historyTrackIDs[0])!
+    assertSpans(spans(of: delayed), [[0.1, 1.0, 0.0, 1.8]])
+  }
+
+  func testEffectsShareOneCopyPerOffset() async throws {
+    let (composition, trackID, instructions) = try await composition(speeds: [1])
+    let a = CustomVideoEffectStage(
+      config: config("a"), renderer: OffsetsOnlyRenderer([200_000, 100_000]))
+    let b = CustomVideoEffectStage(config: config("b"), renderer: OffsetsOnlyRenderer([100_000]))
+
+    _ = try await applyCustomVideoEffectHistory(
+      stages: [a, b], composition: composition, videoTrackID: trackID,
+      instructions: instructions)
+
+    XCTAssertEqual(composition.tracks(withMediaType: .video).count, 3)
+    XCTAssertEqual(a.historyTrackIDs[1], b.historyTrackIDs[0])
+    XCTAssertNotEqual(a.historyTrackIDs[0], a.historyTrackIDs[1])
+  }
+
+  func testWithoutOffsetsNothingIsAdded() async throws {
+    let (composition, trackID, instructions) = try await composition(speeds: [1])
+    let stage = CustomVideoEffectStage(config: config("a"), renderer: OffsetsOnlyRenderer([]))
+
+    let updated = try await applyCustomVideoEffectHistory(
+      stages: [stage], composition: composition, videoTrackID: trackID,
+      instructions: instructions)
+
+    XCTAssertEqual(composition.tracks(withMediaType: .video).count, 1)
+    XCTAssertTrue((updated[0] as! CustomVideoCompositionInstruction).historyTrackIDs.isEmpty)
+  }
+
+  func testAnUnregisteredIdFailsTheRender() {
+    XCTAssertThrowsError(try makeCustomVideoEffectStages([config("nothing.here")]))
+  }
+
+  func testARegisteredFactoryGetsTheParams() throws {
+    var received: [String: Any] = [:]
+    CustomVideoEffects.register("test.params") { params in
+      received = params
+      return OffsetsOnlyRenderer([])
+    }
+    defer { CustomVideoEffects.unregister("test.params") }
+
+    let effect = CustomVideoEffectConfig.fromArguments([
+      "id": "test.params", "params": ["intensity": 0.7], "startUs": 1_000_000,
+    ])!
+    _ = try makeCustomVideoEffectStages([effect])
+
+    XCTAssertEqual(received["intensity"] as? Double, 0.7)
+    XCTAssertTrue(effect.isActive(atUs: 1_000_000))
+    XCTAssertFalse(effect.isActive(atUs: 999_999))
+  }
+
+  func testAnEntryWithoutAnIdIsSkipped() {
+    XCTAssertNil(CustomVideoEffectConfig.fromArguments(["params": [:]]))
+    XCTAssertNil(CustomVideoEffectConfig.fromArguments(["id": ""]))
+  }
+}
+
+/// Pins how keyframes place a layer: `keyframePlacement(_:atUs:)`, an image
+/// layer's keyframed animation and a composition clip's keyframed box. The
+/// Android renderer and the editor preview in `pro_image_editor` place it the
+/// same way.
+final class KeyframeTests: XCTestCase {
+  private func keyframe(
+    _ timeUs: Int64, x: Double = 0, y: Double = 0, scale: Double = 1, rotation: Double = 0,
+    opacity: Double = 1, curve: String = "linear"
+  ) -> KeyframeConfig {
+    KeyframeConfig(
+      timeUs: timeUs, x: x, y: y, scale: scale, rotation: rotation, opacity: opacity,
+      curve: curve)
+  }
+
+  private lazy var path = [
+    keyframe(1_000_000, x: -100, opacity: 0.5),
+    keyframe(3_000_000, x: 100, y: 200, scale: 3, rotation: 2 * .pi),
+  ]
+
+  func testNoKeyframesPlaceNothing() {
+    XCTAssertNil(keyframePlacement([], atUs: 0))
+  }
+
+  func testHoldsTheFirstKeyframeBeforeItAndTheLastAfterIt() {
+    XCTAssertEqual(keyframePlacement(path, atUs: 0)!.x, -100, accuracy: 1e-9)
+    XCTAssertEqual(keyframePlacement(path, atUs: 9_000_000)!.scale, 3, accuracy: 1e-9)
+  }
+
+  func testMixesLinearlyAndKeepsAFullTurn() {
+    let placement = keyframePlacement(path, atUs: 2_000_000)!
+    XCTAssertEqual(placement.x, 0, accuracy: 1e-9)
+    XCTAssertEqual(placement.y, 100, accuracy: 1e-9)
+    XCTAssertEqual(placement.scale, 2, accuracy: 1e-9)
+    XCTAssertEqual(placement.opacity, 0.75, accuracy: 1e-9)
+    XCTAssertEqual(placement.rotation, .pi, accuracy: 1e-9)
+  }
+
+  func testEasesWithTheCurveOfTheEarlierKeyframe() {
+    let eased = [keyframe(0, curve: "easeIn"), keyframe(1_000_000, x: 100)]
+    XCTAssertEqual(keyframePlacement(eased, atUs: 500_000)!.x, 25, accuracy: 1e-9)
+  }
+
+  func testKeepsOpacityAndScaleInRangeWhenACurveOvershoots() {
+    let springy = [
+      keyframe(0, opacity: 0, curve: "elasticOut"), keyframe(1_000_000, scale: 0, opacity: 1),
+    ]
+    for t in stride(from: Int64(0), through: 1_000_000, by: 10_000) {
+      let placement = keyframePlacement(springy, atUs: t)!
+      XCTAssertTrue((0...1).contains(placement.opacity))
+      XCTAssertGreaterThanOrEqual(placement.scale, 0)
+    }
+  }
+
+  // MARK: Image layers
+
+  private func layer(_ animations: [LayerAnimationConfig] = []) -> ImageLayer {
+    ImageLayer(
+      frames: [CIImage.empty()], frameEndsUs: [0], loop: true, animationOffsetUs: 0,
+      startUs: 0, endUs: 10_000_000, x: 0, y: 0, width: nil, height: nil, rotation: 0,
+      animations: animations, censor: nil)
+  }
+
+  /// A 200 x 100 overlay placed by a keyframe at (300, 200) on a 1000 x 500
+  /// frame: in Core Graphics, y up, its box spans y 200...300.
+  private let keyframed = KeyframePlacement(x: 300, y: 200, scale: 2, rotation: .pi / 2, opacity: 0.25)
+  private let keyframedOverlay = CGRect(x: 300, y: 200, width: 200, height: 100)
+  private let frame = CGRect(x: 0, y: 0, width: 1000, height: 500)
+
+  func testAKeyframeScalesTurnsAndFadesTheOverlayAroundItsCenter() {
+    let (opacity, transform, _) = computeAnimation(
+      layer: layer(), currentTimeUs: 0, overlayExtent: keyframedOverlay, frameExtent: frame,
+      keyframe: keyframed)
+    XCTAssertEqual(opacity, 0.25, accuracy: 1e-9)
+    let center = CGPoint(x: 400, y: 250).applying(transform)
+    XCTAssertEqual(center.x, 400, accuracy: 1e-9)
+    XCTAssertEqual(center.y, 250, accuracy: 1e-9)
+    // The right edge's middle, doubled and turned a quarter clockwise: it
+    // ends up below the center, which is towards smaller Y here.
+    let rightEdge = CGPoint(x: 500, y: 250).applying(transform)
+    XCTAssertEqual(rightEdge.x, 400, accuracy: 1e-9)
+    XCTAssertEqual(rightEdge.y, 50, accuracy: 1e-9)
+  }
+
+  func testAKeyframeTurnLeavesTheCensorBlockAreaUpright() {
+    // The pixelate blocks start at the upright, doubled box's corner, as
+    // Android's CensorMaskPlacement.topLeftPixel does, not at the corner of
+    // the box around the turned one.
+    let (_, _, untilted) = computeAnimation(
+      layer: layer(), currentTimeUs: 0, overlayExtent: keyframedOverlay, frameExtent: frame,
+      keyframe: keyframed)
+    let area = keyframedOverlay.applying(untilted)
+    XCTAssertEqual(area.minX, 200, accuracy: 1e-9)
+    XCTAssertEqual(area.minY, 150, accuracy: 1e-9)
+    XCTAssertEqual(area.width, 400, accuracy: 1e-9)
+    XCTAssertEqual(area.height, 200, accuracy: 1e-9)
+  }
+
+  func testASlideStartsFromTheEdgeNearestTheKeyframedBox() {
+    let slide = LayerAnimationConfig(
+      type: "slide", phase: "animateIn", durationUs: 1_000_000, curve: "linear",
+      slideDirection: "left", slideFrom: nil, scaleFrom: nil)
+    let upright = KeyframePlacement(x: 300, y: 200, scale: 2, rotation: 0, opacity: 1)
+    let transform = computeAnimation(
+      layer: layer([slide]), currentTimeUs: 0, overlayExtent: keyframedOverlay,
+      frameExtent: frame, keyframe: upright
+    ).transform
+    // The doubled box's right edge, 600, sits on the frame's left edge.
+    let rightEdge = CGPoint(x: 500, y: 250).applying(transform)
+    XCTAssertEqual(rightEdge.x, 0, accuracy: 1e-9)
+  }
+
+  func testABounceLiftsByTheKeyframedHeight() {
+    let bounce = LayerAnimationConfig(
+      type: "bounce", phase: "animateIn", durationUs: 1_000_000, curve: "linear",
+      slideDirection: nil, slideFrom: nil, scaleFrom: nil, bounceHeight: 1)
+    let upright = KeyframePlacement(x: 300, y: 200, scale: 2, rotation: 0, opacity: 1)
+    let transform = computeAnimation(
+      layer: layer([bounce]), currentTimeUs: 0, overlayExtent: keyframedOverlay,
+      frameExtent: frame, keyframe: upright
+    ).transform
+    // Lifted by the doubled box's whole height.
+    let center = CGPoint(x: 400, y: 250).applying(transform)
+    XCTAssertEqual(center.y, 450, accuracy: 1e-9)
+  }
+
+  // MARK: Composition clips
+
+  private func placement(_ rect: CGRect?, keyframes: [KeyframeConfig]) -> LayerPlacement {
+    LayerPlacement(
+      trackID: 1, opacity: 0.8, targetRect: rect, fit: "contain", rotation: 0.3,
+      preferredTransform: .identity, displaySize: CGSize(width: 400, height: 300),
+      chromaKey: nil, keyframes: keyframes)
+  }
+
+  func testAKeyframeMovesTheBoxScalesItAroundItsCenterAndReplacesTurnAndOpacity() {
+    let box = CGRect(x: 100, y: 200, width: 400, height: 300)
+    let resolved = placement(
+      box, keyframes: [keyframe(0, x: 10, y: 20, scale: 2, rotation: 1, opacity: 0.5)]
+    ).resolved(atUs: 0, renderSize: CGSize(width: 1080, height: 1920))
+    XCTAssertEqual(resolved.rect, CGRect(x: -190, y: -130, width: 800, height: 600))
+    XCTAssertEqual(resolved.rotation, 1, accuracy: 1e-9)
+    XCTAssertEqual(resolved.opacity, 0.5, accuracy: 1e-6)
+  }
+
+  func testABoxlessClipIsTheWholeCanvas() {
+    let resolved = placement(nil, keyframes: [keyframe(0, scale: 0.5)])
+      .resolved(atUs: 0, renderSize: CGSize(width: 1080, height: 1920))
+    XCTAssertEqual(resolved.rect, CGRect(x: 270, y: 480, width: 540, height: 960))
+  }
+
+  // MARK: Keyframe clock
+
+  /// Runs at the output's pace, then twice as fast from 1 s to 1.5 s.
+  private let clock = KeyframeClock(points: [
+    KeyframeClock.Point(outputUs: 1_000_000, keyframeUs: 1_000_000),
+    KeyframeClock.Point(outputUs: 1_500_000, keyframeUs: 2_000_000),
+  ])
+
+  func testAKeyframeClockMapsTheOutputPieceByPiece() {
+    XCTAssertEqual(clock.keyframeTimeUs(400_000), 400_000)
+    XCTAssertEqual(clock.keyframeTimeUs(1_250_000), 1_500_000)
+    XCTAssertEqual(clock.keyframeTimeUs(1_500_000), 2_000_000)
+    // Beyond its points it runs as fast as the output.
+    XCTAssertEqual(clock.keyframeTimeUs(2_000_000), 2_500_000)
+    XCTAssertEqual(clock.keyframeTimeUs(-300_000), -300_000)
+    XCTAssertEqual(KeyframeClock.output.keyframeTimeUs(1_234), 1_234)
+  }
+
+  func testAKeyframeClockJumpsWhereTwoPointsShareAnOutputTime() {
+    let jump = KeyframeClock(points: [
+      KeyframeClock.Point(outputUs: 0, keyframeUs: 0),
+      KeyframeClock.Point(outputUs: 1_000_000, keyframeUs: 1_000_000),
+      KeyframeClock.Point(outputUs: 1_000_000, keyframeUs: 3_000_000),
+      KeyframeClock.Point(outputUs: 2_000_000, keyframeUs: 4_000_000),
+    ])
+    XCTAssertEqual(jump.keyframeTimeUs(1_000_000), 1_000_000)
+    XCTAssertEqual(jump.keyframeTimeUs(1_500_000), 3_500_000)
+    XCTAssertEqual(jump.keyframeTimeUs(3_000_000), 5_000_000)
+  }
+
+  func testAKeyframeClockRoundsTiesToEven() {
+    // Half way down from 1 µs to -2 µs is -0.5 µs, 1.5 µs below the start.
+    let falling = KeyframeClock(points: [
+      KeyframeClock.Point(outputUs: 0, keyframeUs: 1),
+      KeyframeClock.Point(outputUs: 2, keyframeUs: -2),
+    ])
+    XCTAssertEqual(falling.keyframeTimeUs(1), -1)
+  }
+
+  func testAKeyframeClockReadsItsPointsSortedAndSkipsBrokenOnes() {
+    let parsed = KeyframeClock.from([
+      ["outputUs": 1_500_000, "keyframeUs": 2_000_000],
+      "not a point",
+      ["outputUs": 1_000_000],
+      ["outputUs": 1_000_000, "keyframeUs": 1_000_000],
+    ] as [Any])
+    XCTAssertEqual(parsed, clock)
+    XCTAssertEqual(KeyframeClock.from(nil), .output)
+  }
+
+  func testAClipIsPlacedAtItsTimeOnItsKeyframeClock() {
+    let box = CGRect(x: 100, y: 200, width: 400, height: 300)
+    let keyframes = [keyframe(0, x: 0, curve: "bounceOut"), keyframe(3_000_000, x: 100)]
+    var onClock = placement(box, keyframes: keyframes)
+    onClock.keyframeClock = clock
+    let renderSize = CGSize(width: 1080, height: 1920)
+    // 1.25 s of output is 1.5 s on the clock, along the bouncing curve.
+    let resolved = onClock.resolved(atUs: 1_250_000, renderSize: renderSize)
+    let direct = placement(box, keyframes: keyframes).resolved(
+      atUs: 1_500_000, renderSize: renderSize)
+    XCTAssertEqual(resolved.rect!.minX, direct.rect!.minX, accuracy: 1e-9)
+  }
+
+  func testWithoutKeyframesTheClipKeepsItsOwnPlacement() {
+    let box = CGRect(x: 100, y: 200, width: 400, height: 300)
+    let resolved = placement(box, keyframes: [])
+      .resolved(atUs: 0, renderSize: CGSize(width: 1080, height: 1920))
+    XCTAssertEqual(resolved.rect, box)
+    XCTAssertEqual(resolved.rotation, 0.3, accuracy: 1e-9)
+    XCTAssertEqual(resolved.opacity, 0.8, accuracy: 1e-6)
+  }
+}
+
+/// The audio visualizer layer. The shape numbers are those of the Dart
+/// `audio_visualizer_shapes_test.dart` and the Kotlin
+/// `AudioVisualizerShapesTest`, so the export draws what the editor
+/// previews. Change them together.
+final class AudioVisualizerTests: XCTestCase {
+
+  /// Two bands, ten rows a second: [0, 1] at 0 s, [1, 0] at 0.1 s.
+  private let visualizer = LayerAudioVisualizerConfig(
+    style: .bars, color: 0xFFFF_FFFF, bandCount: 2, levels: [0, 1, 1, 0],
+    framesPerSecond: 10)
+
+  private func levels(atUs timeUs: Int64) -> [Float] {
+    var levels = [Float](repeating: 0, count: 2)
+    visualizer.levels(atUs: timeUs, into: &levels)
+    return levels
+  }
+
+  private func assertBars(
+    _ expected: [AudioVisualizerBar], _ actual: [AudioVisualizerBar],
+    file: StaticString = #filePath, line: UInt = #line
+  ) {
+    XCTAssertEqual(expected.count, actual.count, file: file, line: line)
+    for (e, a) in zip(expected, actual) {
+      XCTAssertEqual(e.left, a.left, accuracy: 1e-9, file: file, line: line)
+      XCTAssertEqual(e.top, a.top, accuracy: 1e-9, file: file, line: line)
+      XCTAssertEqual(e.right, a.right, accuracy: 1e-9, file: file, line: line)
+      XCTAssertEqual(e.bottom, a.bottom, accuracy: 1e-9, file: file, line: line)
+      XCTAssertEqual(e.radius, a.radius, accuracy: 1e-9, file: file, line: line)
+      XCTAssertEqual(e.pivotX, a.pivotX, accuracy: 1e-9, file: file, line: line)
+      XCTAssertEqual(e.pivotY, a.pivotY, accuracy: 1e-9, file: file, line: line)
+      XCTAssertEqual(e.rotation, a.rotation, accuracy: 1e-9, file: file, line: line)
+    }
+  }
+
+  func testALayerWithoutVisualizerDrawsItsImage() {
+    XCTAssertNil(LayerAudioVisualizerConfig.fromArguments(nil))
+  }
+
+  func testParsesTheChannelMap() throws {
+    let levels: [Float] = [0.25, 0.5]
+    let data = levels.withUnsafeBufferPointer { Data(buffer: $0) }
+    let parsed = try XCTUnwrap(
+      LayerAudioVisualizerConfig.fromArguments([
+        "style": "mirroredBars",
+        // An opaque color does not fit a 32-bit int in Dart.
+        "color": NSNumber(value: Int64(0xFF27_C58B)),
+        "bandCount": 2,
+        "levels": FlutterStandardTypedData(float32: data),
+        "framesPerSecond": 30.0,
+        "barFill": 0.4,
+      ]))
+
+    XCTAssertEqual(parsed.style, .mirroredBars)
+    XCTAssertEqual(parsed.color, 0xFF27_C58B)
+    XCTAssertEqual(parsed.bandCount, 2)
+    XCTAssertEqual(parsed.levels, [0.25, 0.5])
+    XCTAssertEqual(parsed.framesPerSecond, 30)
+    XCTAssertEqual(parsed.barFill, 0.4)
+  }
+
+  func testFallsBackToTheDartDefaultsAndKeepsWholeRows() throws {
+    let parsed = try XCTUnwrap(
+      LayerAudioVisualizerConfig.fromArguments([
+        "style": "spiral",
+        "bandCount": 2,
+        "levels": [0.5, 0.5, 1.0],
+        "framesPerSecond": 0,
+        "barFill": 1.5,
+      ]))
+
+    XCTAssertEqual(parsed.style, .bars)
+    XCTAssertNil(parsed.barFill)
+    XCTAssertEqual(parsed.color, 0xFFFF_FFFF)
+    XCTAssertEqual(parsed.levels, [0.5, 0.5])
+    XCTAssertEqual(parsed.framesPerSecond, 60)
+  }
+
+  func testAnImageLayerCarriesItsVisualizer() throws {
+    let layer = try XCTUnwrap(
+      ImageLayerConfig.fromArguments([
+        "imageData": FlutterStandardTypedData(bytes: Data([1, 2, 3])),
+        "audioVisualizer": ["style": "wave", "bandCount": 1, "levels": [0.5]],
+      ]))
+
+    XCTAssertEqual(layer.audioVisualizer?.style, .wave)
+  }
+
+  func testReadsARowAtItsOwnTimeAndMixesBetweenRows() {
+    XCTAssertEqual(levels(atUs: 0), [0, 1])
+    XCTAssertEqual(levels(atUs: 100_000), [1, 0])
+    let mixed = levels(atUs: 25_000)
+    XCTAssertEqual(mixed[0], 0.25, accuracy: 1e-6)
+    XCTAssertEqual(mixed[1], 0.75, accuracy: 1e-6)
+  }
+
+  func testFadesToSilenceAfterTheLastRowAndBeforeTheFirst() {
+    XCTAssertEqual(levels(atUs: 150_000), [0.5, 0])
+    XCTAssertEqual(levels(atUs: 200_000), [0, 0])
+    XCTAssertEqual(levels(atUs: -50_000), [0, 0.5])
+  }
+
+  func testBarsStandOnTheBottomASilentOneAsADot() {
+    let shapes = audioVisualizerShapes(
+      style: .bars, width: 100, height: 50, levels: [0, 0.5, 1, 0.2])
+
+    XCTAssertNil(shapes.wave)
+    assertBars(
+      [
+        AudioVisualizerBar(left: 3.75, top: 32.5, right: 21.25, bottom: 50, radius: 8.75),
+        AudioVisualizerBar(left: 28.75, top: 25, right: 46.25, bottom: 50, radius: 8.75),
+        AudioVisualizerBar(left: 53.75, top: 0, right: 71.25, bottom: 50, radius: 8.75),
+        AudioVisualizerBar(left: 78.75, top: 32.5, right: 96.25, bottom: 50, radius: 8.75),
+      ], shapes.bars)
+  }
+
+  func testMirroredBarsGrowFromTheMiddle() {
+    let shapes = audioVisualizerShapes(
+      style: .mirroredBars, width: 100, height: 50, levels: [0, 0.5, 1, 0.2])
+
+    assertBars(
+      [
+        AudioVisualizerBar(left: 3.75, top: 16.25, right: 21.25, bottom: 33.75, radius: 8.75),
+        AudioVisualizerBar(left: 28.75, top: 12.5, right: 46.25, bottom: 37.5, radius: 8.75),
+        AudioVisualizerBar(left: 53.75, top: 0, right: 71.25, bottom: 50, radius: 8.75),
+        AudioVisualizerBar(left: 78.75, top: 16.25, right: 96.25, bottom: 33.75, radius: 8.75),
+      ], shapes.bars)
+  }
+
+  func testACircleMirrorsTheBandsDownBothSidesOfItsRing() {
+    let shapes = audioVisualizerShapes(style: .circle, width: 200, height: 100, levels: [1, 0])
+
+    func bar(_ top: Double, _ rotation: Double) -> AudioVisualizerBar {
+      AudioVisualizerBar(
+        left: -6.25, top: top, right: 6.25, bottom: -25, radius: 6.25, pivotX: 100,
+        pivotY: 50, rotation: rotation)
+    }
+    assertBars(
+      [
+        bar(-50, Double.pi / 4), bar(-37.5, 3 * Double.pi / 4),
+        bar(-37.5, 5 * Double.pi / 4), bar(-50, 7 * Double.pi / 4),
+      ], shapes.bars)
+  }
+
+  func testABarFillsTheShareOfItsSlotItIsGiven() {
+    let shapes = audioVisualizerShapes(
+      style: .bars, width: 100, height: 50, levels: [1, 0], barFill: 0.5)
+
+    assertBars(
+      [
+        AudioVisualizerBar(left: 12.5, top: 0, right: 37.5, bottom: 50, radius: 12.5),
+        AudioVisualizerBar(left: 62.5, top: 25, right: 87.5, bottom: 50, radius: 12.5),
+      ], shapes.bars)
+  }
+
+  func testARingOfBarsFillsTheShareOfTheRingItIsGiven() {
+    let shapes = audioVisualizerShapes(
+      style: .circle, width: 200, height: 100, levels: [1, 0], barFill: 0.2)
+    // 2 pi 25 / 4 * 0.2 wide, leaving 25 - that for the loudest bar.
+    let w = 7.853981633974483
+
+    func bar(_ top: Double, _ rotation: Double) -> AudioVisualizerBar {
+      AudioVisualizerBar(
+        left: -w / 2, top: top, right: w / 2, bottom: -25, radius: w / 2, pivotX: 100,
+        pivotY: 50, rotation: rotation)
+    }
+    assertBars(
+      [
+        bar(-50, Double.pi / 4), bar(-(25 + w), 3 * Double.pi / 4),
+        bar(-(25 + w), 5 * Double.pi / 4), bar(-50, 7 * Double.pi / 4),
+      ], shapes.bars)
+  }
+
+  func testAWaveTapersAtTheEdgesAndStaysInsideTheBox() throws {
+    let shapes = audioVisualizerShapes(style: .wave, width: 40, height: 20, levels: [0.5, 1])
+    let expected: [Double] = [
+      0, 10,
+      1.6666666667, 9.1666666667, 5, 6.6666666667, 10, 5,
+      15, 3.3333333333, 25, 0, 30, 0,
+      35, 0.8333333333, 38.3333333333, 8.3333333333, 40, 10,
+      38.3333333333, 11.6666666667, 35, 19.1666666667, 30, 20,
+      25, 20, 15, 16.6666666667, 10, 15,
+      5, 13.3333333333, 1.6666666667, 10.8333333333, 0, 10,
+    ]
+
+    XCTAssertTrue(shapes.bars.isEmpty)
+    let wave = try XCTUnwrap(shapes.wave)
+    XCTAssertEqual(wave.count, expected.count)
+    for (index, value) in expected.enumerated() {
+      XCTAssertEqual(wave[index], value, accuracy: 1e-9, "value \(index)")
+    }
+  }
+
+  func testCountsANaNLevelAsSilent() {
+    let broken = LayerAudioVisualizerConfig(
+      style: .bars, color: 0xFFFF_FFFF, bandCount: 1, levels: [.nan, 1], framesPerSecond: 1)
+    var levels: [Float] = [0]
+    broken.levels(atUs: 0, into: &levels)
+    XCTAssertEqual(levels, [0])
+    broken.levels(atUs: 500_000, into: &levels)
+    XCTAssertEqual(levels[0], 0.5, accuracy: 1e-6)
+
+    for style: LayerAudioVisualizerConfig.Style in [.bars, .mirroredBars, .wave, .circle] {
+      let silent = audioVisualizerShapes(style: style, width: 100, height: 50, levels: [0, 1])
+      let shapes = audioVisualizerShapes(style: style, width: 100, height: 50, levels: [.nan, 1])
+      assertBars(silent.bars, shapes.bars)
+      XCTAssertEqual(silent.wave, shapes.wave, "\(style)")
+    }
+  }
+
+  func testDrawsNothingWithoutBandsOrWithoutABox() {
+    for style: LayerAudioVisualizerConfig.Style in [.bars, .mirroredBars, .wave, .circle] {
+      let empty = audioVisualizerShapes(style: style, width: 0, height: 10, levels: [1])
+      XCTAssertTrue(empty.bars.isEmpty)
+      XCTAssertNil(empty.wave)
+      XCTAssertTrue(audioVisualizerShapes(style: style, width: 10, height: 10, levels: []).bars.isEmpty)
+    }
+  }
+
+  /// The RGBA bytes of [image], drawn top row first.
+  private func pixels(of image: CIImage) -> (width: Int, height: Int, bytes: [UInt8]) {
+    let width = Int(image.extent.width)
+    let height = Int(image.extent.height)
+    var bytes = [UInt8](repeating: 0, count: width * height * 4)
+    CIContext().render(
+      image, toBitmap: &bytes, rowBytes: width * 4, bounds: image.extent, format: .RGBA8,
+      colorSpace: CGColorSpace(name: CGColorSpace.sRGB))
+    return (width, height, bytes)
+  }
+
+  func testTheRendererDrawsTheBarsInTheBoxColorTopRowFirst() {
+    // One loud band and one silent one, 100 x 50 at twice the resolution.
+    let renderer = AudioVisualizerRenderer(
+      config: LayerAudioVisualizerConfig(
+        style: .bars, color: 0xFFFF_0000, bandCount: 2, levels: [1, 0], framesPerSecond: 1),
+      rasterScale: 2)
+    let image = renderer.image(atUs: 0, box: CGSize(width: 100, height: 50))
+    let (width, height, bytes) = pixels(of: image)
+    func pixel(_ x: Int, _ y: Int) -> [UInt8] {
+      let at = (y * width + x) * 4
+      return Array(bytes[at..<at + 4])
+    }
+
+    XCTAssertEqual(width, 200)
+    XCTAssertEqual(height, 100)
+    // The loud bar fills its slot from top to bottom.
+    XCTAssertEqual(pixel(50, 10), [255, 0, 0, 255])
+    XCTAssertEqual(pixel(50, 90), [255, 0, 0, 255])
+    // The silent one is a dot at the bottom, not at the top.
+    XCTAssertEqual(pixel(150, 10)[3], 0)
+    XCTAssertEqual(pixel(150, 90), [255, 0, 0, 255])
+    // The gap between the bars stays clear.
+    XCTAssertEqual(pixel(100, 50)[3], 0)
+  }
+
+  func testTheRendererKeepsTheImageOfTheFrameItLastDrew() {
+    let renderer = AudioVisualizerRenderer(config: visualizer, rasterScale: 1)
+    let box = CGSize(width: 40, height: 20)
+
+    let first = renderer.image(atUs: 0, box: box)
+    XCTAssertTrue(first === renderer.image(atUs: 0, box: box))
+    XCTAssertFalse(first === renderer.image(atUs: 50_000, box: box))
+  }
+
+  func testTheRendererHoldsAHugeLayerToTheLargestRaster() {
+    let renderer = AudioVisualizerRenderer(config: visualizer, rasterScale: 2)
+    let image = renderer.image(atUs: 0, box: CGSize(width: 8192, height: 1024))
+
+    XCTAssertEqual(image.extent.width, AudioVisualizerRenderer.maxRasterSide)
+    XCTAssertEqual(image.extent.height, 512)
+  }
+}
+
+// MARK: - Layer masks
+
+/// Pins `VideoLayer.mask` on the Apple renderer: how the matte is decoded and
+/// how it shapes a clip's frame before the frame is placed.
+///
+/// The compositor itself is covered end to end by the example's
+/// `layer_mask_test` integration test; these pin the two helpers it calls, on
+/// frames small enough to read back pixel by pixel.
+final class LayerMaskTests: XCTestCase {
+
+  private let context = CIContext(options: [
+    .workingColorSpace: NSNull(),
+    .outputColorSpace: CGColorSpace(name: CGColorSpace.sRGB)!,
+  ])
+
+  /// A PNG of [width]×[height] whose pixel at (x, y), y counted from the top,
+  /// has the straight color and alpha [pixel] returns. [orientation] is written
+  /// as its EXIF tag.
+  private func png(
+    width: Int, height: Int, orientation: UInt32? = nil,
+    _ pixel: (Int, Int) -> (r: UInt8, g: UInt8, b: UInt8, a: UInt8)
+  ) throws -> Data {
+    var bytes = [UInt8](repeating: 0, count: width * height * 4)
+    for y in 0..<height {
+      for x in 0..<width {
+        let p = pixel(x, y)
+        let i = (y * width + x) * 4
+        // Premultiplied, as the context below stores it.
+        bytes[i] = UInt8(Int(p.r) * Int(p.a) / 255)
+        bytes[i + 1] = UInt8(Int(p.g) * Int(p.a) / 255)
+        bytes[i + 2] = UInt8(Int(p.b) * Int(p.a) / 255)
+        bytes[i + 3] = p.a
+      }
+    }
+    let provider = try XCTUnwrap(CGDataProvider(data: Data(bytes) as CFData))
+    let image = try XCTUnwrap(
+      CGImage(
+        width: width, height: height, bitsPerComponent: 8, bitsPerPixel: 32,
+        bytesPerRow: width * 4, space: CGColorSpace(name: CGColorSpace.sRGB)!,
+        bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.premultipliedLast.rawValue),
+        provider: provider, decode: nil, shouldInterpolate: false, intent: .defaultIntent))
+
+    let data = NSMutableData()
+    let destination = try XCTUnwrap(
+      CGImageDestinationCreateWithData(data, "public.png" as CFString, 1, nil))
+    let properties: [CFString: Any] =
+      orientation.map { [kCGImagePropertyOrientation: $0] } ?? [:]
+    CGImageDestinationAddImage(destination, image, properties as CFDictionary)
+    XCTAssertTrue(CGImageDestinationFinalize(destination))
+    return data as Data
+  }
+
+  /// A matte of [width]×[height], opaque on its left half and clear on its
+  /// right half.
+  private func leftHalfMatte(width: Int = 8, height: Int = 4) throws -> CIImage {
+    let data = try png(width: width, height: height) { x, _ in
+      (255, 255, 255, x < width / 2 ? 255 : 0)
+    }
+    return try XCTUnwrap(decodeLayerMatte(.bytes(data), fittingWithin: .zero))
+  }
+
+  /// A solid frame of [size] at [origin], which need not be the origin.
+  private func frame(
+    _ color: CIColor, _ size: CGSize, origin: CGPoint = .zero
+  ) -> CIImage {
+    CIImage(color: color).cropped(to: CGRect(origin: origin, size: size))
+  }
+
+  /// [image] rendered as premultiplied RGBA, rows from the top, with a reader
+  /// for the pixel at (x, y) counted from its top-left corner.
+  private func pixels(_ image: CIImage) -> (Int, Int) -> [UInt8] {
+    let extent = image.extent
+    let width = Int(extent.width)
+    let height = Int(extent.height)
+    var bytes = [UInt8](repeating: 0, count: width * height * 4)
+    context.render(
+      image, toBitmap: &bytes, rowBytes: width * 4, bounds: extent, format: .RGBA8,
+      colorSpace: CGColorSpace(name: CGColorSpace.sRGB)!)
+    return { x, y in
+      let i = (y * width + x) * 4
+      return Array(bytes[i..<i + 4])
+    }
+  }
+
+  /// The alpha of every pixel of [image], rows from the top.
+  private func alphaRows(_ image: CIImage) -> [[UInt8]] {
+    let extent = image.extent
+    let width = Int(extent.width)
+    let height = Int(extent.height)
+    var bytes = [UInt8](repeating: 0, count: width * height)
+    context.render(
+      image, toBitmap: &bytes, rowBytes: width, bounds: extent, format: .A8, colorSpace: nil)
+    return (0..<height).map { Array(bytes[($0 * width)..<(($0 + 1) * width)]) }
+  }
+
+  // MARK: Applying the matte
+
+  func testTheClipShowsWhereTheMatteIsOpaqueAndNotWhereItIsClear() throws {
+    let red = CIColor(red: 1, green: 0, blue: 0)
+    let masked = applyLayerMatte(
+      try leftHalfMatte(), to: frame(red, CGSize(width: 200, height: 100)))
+    let pixel = pixels(masked)
+
+    // Each matte column covers 25 frame columns; the edge ramps between the
+    // centers of the two around it, from x = 87.5 to x = 112.5.
+
+    XCTAssertEqual(masked.extent, CGRect(x: 0, y: 0, width: 200, height: 100))
+    for y in [5, 50, 95] {
+      XCTAssertEqual(pixel(20, y), [255, 0, 0, 255])
+      XCTAssertEqual(pixel(70, y), [255, 0, 0, 255])
+      XCTAssertEqual(pixel(130, y), [0, 0, 0, 0])
+      XCTAssertEqual(pixel(190, y), [0, 0, 0, 0])
+    }
+  }
+
+  /// Only the alpha counts: a blue matte does not tint a red clip.
+  func testTheMattesColorsAreIgnored() throws {
+    let data = try png(width: 4, height: 4) { _, _ in (0, 0, 255, 255) }
+    let matte = try XCTUnwrap(decodeLayerMatte(.bytes(data), fittingWithin: .zero))
+    let masked = applyLayerMatte(
+      matte, to: frame(CIColor(red: 1, green: 0, blue: 0), CGSize(width: 40, height: 40)))
+
+    XCTAssertEqual(pixels(masked)(20, 20), [255, 0, 0, 255])
+  }
+
+  /// Partial alpha multiplies, which on premultiplied pixels scales color and
+  /// alpha together — and folds into a clip that is already see-through, such
+  /// as one a chroma key left half transparent.
+  func testPartialAlphaMultipliesTheClipsOwnAlpha() throws {
+    let data = try png(width: 4, height: 4) { _, _ in (255, 255, 255, 128) }
+    let matte = try XCTUnwrap(decodeLayerMatte(.bytes(data), fittingWithin: .zero))
+
+    let opaque = pixels(
+      applyLayerMatte(
+        matte, to: frame(CIColor(red: 1, green: 0, blue: 0), CGSize(width: 20, height: 20))
+      ))(10, 10)
+    XCTAssertEqual(Int(opaque[3]), 128, accuracy: 1)
+    XCTAssertEqual(Int(opaque[0]), 128, accuracy: 1)
+
+    let halfKeyed = pixels(
+      applyLayerMatte(
+        matte,
+        to: frame(CIColor(red: 1, green: 0, blue: 0, alpha: 0.5), CGSize(width: 20, height: 20))
+      ))(10, 10)
+    XCTAssertEqual(Int(halfKeyed[3]), 64, accuracy: 1)
+    // Still pure red once unpremultiplied.
+    XCTAssertEqual(Int(halfKeyed[0]), Int(halfKeyed[3]), accuracy: 1)
+  }
+
+  /// The matte covers the frame wherever the frame sits, top to top: a frame
+  /// coming off the orientation step need not start at the origin, and Core
+  /// Image counts y upwards.
+  func testTheMatteIsStretchedOverTheFrameTopToTop() throws {
+    let data = try png(width: 4, height: 4) { _, y in (255, 255, 255, y < 2 ? 255 : 0) }
+    let matte = try XCTUnwrap(decodeLayerMatte(.bytes(data), fittingWithin: .zero))
+    let masked = applyLayerMatte(
+      matte,
+      to: frame(
+        CIColor(red: 0, green: 1, blue: 0), CGSize(width: 60, height: 120),
+        origin: CGPoint(x: 35, y: -20)))
+    let pixel = pixels(masked)
+
+    // Each matte row covers 30 frame rows, and the stretch samples linearly
+    // between row centers, so the edge ramps from row 45 to row 75.
+    XCTAssertEqual(masked.extent, CGRect(x: 35, y: -20, width: 60, height: 120))
+    XCTAssertEqual(pixel(30, 10), [0, 255, 0, 255])
+    XCTAssertEqual(pixel(30, 40), [0, 255, 0, 255])
+    XCTAssertEqual(pixel(30, 80), [0, 0, 0, 0])
+    XCTAssertEqual(pixel(30, 110), [0, 0, 0, 0])
+  }
+
+  /// A matte that is opaque to its edges keeps the clip whole to its edges: a
+  /// stretch that sampled the transparency beyond the matte would fade the
+  /// clip's outermost pixels.
+  func testAnOpaqueMatteLeavesNoFringeAtTheFrameEdge() throws {
+    let data = try png(width: 3, height: 3) { _, _ in (255, 255, 255, 255) }
+    let matte = try XCTUnwrap(decodeLayerMatte(.bytes(data), fittingWithin: .zero))
+    let masked = applyLayerMatte(
+      matte, to: frame(CIColor(red: 1, green: 0, blue: 0), CGSize(width: 101, height: 67)))
+    let rows = alphaRows(masked)
+
+    XCTAssertEqual(Set(rows.first!), [255])
+    XCTAssertEqual(Set(rows.last!), [255])
+    XCTAssertEqual(Set(rows.map { $0.first! }), [255])
+    XCTAssertEqual(Set(rows.map { $0.last! }), [255])
+  }
+
+  // MARK: Decoding the matte
+
+  func testTheDecodedMatteKeepsItsAlphaAtTheOrigin() throws {
+    let matte = try leftHalfMatte()
+
+    XCTAssertEqual(matte.extent, CGRect(x: 0, y: 0, width: 8, height: 4))
+    XCTAssertEqual(alphaRows(matte), Array(repeating: [255, 255, 255, 255, 0, 0, 0, 0], count: 4))
+  }
+
+  /// No more pixels than the largest frame it is stretched over, on each axis
+  /// on its own, since the stretch is per axis too.
+  func testTheDecodedMatteIsNoLargerThanTheLargestFrame() throws {
+    let data = try png(width: 64, height: 32) { x, _ in (255, 255, 255, x < 32 ? 255 : 0) }
+
+    let capped = try XCTUnwrap(
+      decodeLayerMatte(.bytes(data), fittingWithin: CGSize(width: 16, height: 100)))
+    XCTAssertEqual(capped.extent, CGRect(x: 0, y: 0, width: 16, height: 32))
+    let row = alphaRows(capped)[16]
+    XCTAssertGreaterThanOrEqual(row[2], 250)
+    XCTAssertLessThanOrEqual(row[13], 5)
+
+    let whole = try XCTUnwrap(decodeLayerMatte(.bytes(data), fittingWithin: .zero))
+    XCTAssertEqual(whole.extent, CGRect(x: 0, y: 0, width: 64, height: 32))
+  }
+
+  /// EXIF 6 displays the stored pixels turned 90° clockwise, so the stored
+  /// left half — the opaque one — becomes the top half.
+  func testTheMattesExifOrientationIsApplied() throws {
+    let data = try png(width: 8, height: 4, orientation: 6) { x, _ in
+      (255, 255, 255, x < 4 ? 255 : 0)
+    }
+    let matte = try XCTUnwrap(decodeLayerMatte(.bytes(data), fittingWithin: .zero))
+    let rows = alphaRows(matte)
+
+    XCTAssertEqual(matte.extent, CGRect(x: 0, y: 0, width: 4, height: 8))
+    XCTAssertEqual(rows[1], [255, 255, 255, 255])
+    XCTAssertEqual(rows[6], [0, 0, 0, 0])
+  }
+
+  func testAMatteFileIsReadOffDisk() throws {
+    let url = FileManager.default.temporaryDirectory
+      .appendingPathComponent("layer_mask_\(UUID().uuidString).png")
+    try png(width: 8, height: 4) { x, _ in (255, 255, 255, x < 4 ? 255 : 0) }.write(to: url)
+    defer { try? FileManager.default.removeItem(at: url) }
+
+    let matte = try XCTUnwrap(decodeLayerMatte(.file(url.path), fittingWithin: .zero))
+    XCTAssertEqual(alphaRows(matte)[2], [255, 255, 255, 255, 0, 0, 0, 0])
+  }
+
+  func testAMatteThatDoesNotDecodeIsNil() {
+    XCTAssertNil(decodeLayerMatte(.bytes(Data([0x00, 0x01, 0x02, 0x03])), fittingWithin: .zero))
+    XCTAssertNil(decodeLayerMatte(.file("/does/not/exist.png"), fittingWithin: .zero))
+  }
+
+  // MARK: Channel map
+
+  func testALayerReadsItsMatteOffTheChannelMap() {
+    let clips: [[String: Any]] = [["inputPath": "/videos/pip.mp4"]]
+
+    XCTAssertNil(LayerConfig.fromArguments(["clips": clips])?.mask)
+    XCTAssertEqual(
+      LayerConfig.fromArguments(["clips": clips, "maskPath": "/mattes/circle.png"])?.mask,
+      .file("/mattes/circle.png"))
+    XCTAssertEqual(
+      LayerConfig.fromArguments([
+        "clips": clips, "maskData": FlutterStandardTypedData(bytes: Data([1, 2, 3])),
+      ])?.mask,
+      .bytes(Data([1, 2, 3])))
+  }
+}
+
+/// How a stabilized clip is rendered: which keyframe a frame takes, and the
+/// render paths that must keep it.
+final class StabilizationTests: XCTestCase {
+
+  /// Keyframes 0.1 apart in dx, one per frame of a 30 fps source.
+  private func stabilization(_ timesUs: [Int64]) -> StabilizationConfig {
+    StabilizationConfig(
+      timesUs: timesUs,
+      values: timesUs.indices.flatMap { [0.1 * Double($0), 0, 0, 1.1] },
+      sourceOffsetUs: 0)
+  }
+
+  /// A render whose frame times fall between two source frames shows the
+  /// earlier one, so its keyframe applies unblended.
+  func testStabilizationHoldsTheKeyframeOfTheFrameOnScreen() {
+    let config = stabilization([0, 33_333, 66_667, 100_000])
+    XCTAssertEqual(config.transform(atFileUs: 33_000, frameUs: 33_333).dx, 0.1, accuracy: 1e-9)
+    XCTAssertEqual(config.transform(atFileUs: 50_000, frameUs: 33_333).dx, 0.1, accuracy: 1e-9)
+    XCTAssertEqual(config.transform(atFileUs: 400_000, frameUs: 33_333).dx, 0.3, accuracy: 1e-9)
+  }
+
+  /// A 60 fps source analyzed at 30 fps: every keyframe gap is the same, yet
+  /// the frame between two keyframes was never measured and is interpolated.
+  func testStabilizationInterpolatesFramesAFrameRateCapSkipped() {
+    let config = stabilization([0, 33_333, 66_667, 100_000])
+    XCTAssertEqual(config.transform(atFileUs: 33_333, frameUs: 16_667).dx, 0.1, accuracy: 1e-9)
+    XCTAssertEqual(config.transform(atFileUs: 50_000, frameUs: 16_667).dx, 0.15, accuracy: 1e-3)
+    XCTAssertEqual(config.transform(atFileUs: 60_000, frameUs: 16_667).dx, 0.15, accuracy: 1e-3)
+  }
+
+  /// Re-trimming a clip around a transition reads the same file, whose frames
+  /// keep their times; only a pre-transcode of part of it moves them.
+  func testReadingTheSameFileKeepsTheKeyframesOnTheirFrames() {
+    let clip = VideoClip(
+      inputPath: "/tmp/clip.mp4", startUs: 1_000_000, endUs: 3_000_000,
+      stabilization: stabilization([0, 33_333]))
+    XCTAssertEqual(
+      clip.reading("/tmp/clip.mp4", startUs: 2_000_000, endUs: 3_000_000)
+        .stabilization?.sourceOffsetUs, 0)
+    XCTAssertEqual(
+      clip.reading("/tmp/window.mp4", startUs: 0, endUs: 2_000_000, sourceShiftUs: 1_000_000)
+        .stabilization?.sourceOffsetUs, 1_000_000)
+  }
+
+  /// A bitrate cap used to remux a lone stabilized clip as it was, which left
+  /// its stabilization out of the export.
+  func testAStabilizedClipIsNotRemuxedPastItsStabilization() throws {
+    let config = try XCTUnwrap(
+      RenderConfig.fromArguments([
+        "videoClips": [
+          [
+            "inputPath": "/tmp/clip.mp4",
+            "stabilization": ["timesUs": [0, 33_333], "values": [0, 0, 0, 1.1, 0, 0, 0, 1.1]],
+          ]
+        ],
+        "outputPath": "/tmp/out.mp4",
+        "outputFormat": "mp4",
+        "enableAudio": true,
+      ]))
+    XCTAssertFalse(BitrateCapPolicy.isPassthroughEligible(config))
+  }
+}
+
+final class SpeedRampTests: XCTestCase {
+
+  /// Fast, slow motion, fast: 0.4 of the source at 2x, 0.2 at 0.25x, 0.4 at 2x.
+  private let ramp = SpeedRamp(steps: [
+    SpeedRamp.Step(start: 0, end: 0.4, speed: 2),
+    SpeedRamp.Step(start: 0.4, end: 0.6, speed: 0.25),
+    SpeedRamp.Step(start: 0.6, end: 1, speed: 2),
+  ])
+
+  private func seconds(_ value: Double) -> CMTime {
+    CMTime(value: CMTimeValue((value * 1_000_000).rounded()), timescale: 1_000_000)
+  }
+
+  /// Scaling a range moves everything after it, so the last step goes first
+  /// and every range is still where it was computed when its turn comes.
+  func testSpeedScalesComeLastStepFirst() {
+    let clip = VideoClip(
+      inputPath: "/tmp/clip.mp4", startUs: nil, endUs: nil, speedRamp: ramp)
+    let scales = VideoSequenceBuilder.speedScales(
+      for: clip, at: seconds(1), duration: seconds(3))
+
+    XCTAssertEqual(scales.map { $0.range.start.seconds }, [2.8, 2.2, 1.0])
+    XCTAssertEqual(scales.map { $0.range.duration.seconds }, [1.2, 0.6, 1.2])
+    XCTAssertEqual(scales.map { $0.duration.seconds }, [0.6, 2.4, 0.6])
+    let total = scales.reduce(CMTime.zero) { CMTimeAdd($0, $1.duration) }
+    XCTAssertEqual(total.seconds, 3 * ramp.durationFactor, accuracy: 1e-9)
+  }
+
+  func testSpeedScalesForAConstantSpeedAndNone() {
+    let fast = VideoClip(inputPath: "/tmp/clip.mp4", startUs: nil, endUs: nil, playbackSpeed: 2)
+    let plain = VideoClip(inputPath: "/tmp/clip.mp4", startUs: nil, endUs: nil)
+
+    let scales = VideoSequenceBuilder.speedScales(for: fast, at: .zero, duration: seconds(3))
+    XCTAssertEqual(scales.count, 1)
+    XCTAssertEqual(scales.first?.duration.seconds ?? 0, 1.5, accuracy: 1e-9)
+    XCTAssertTrue(VideoSequenceBuilder.speedScales(for: plain, at: .zero, duration: seconds(3)).isEmpty)
+  }
+
+  /// An audio track that ends before the picture used to hold its last
+  /// sample for the rest of the clip, a DC level that clicks in and out.
+  func testResampleIsSilentPastTheDecodedSound() {
+    let source = [Int16](repeating: 1000, count: 100)
+    let constant = SpeedRamp(steps: [SpeedRamp.Step(start: 0, end: 1, speed: 1)])
+    let output = source.withUnsafeBufferPointer {
+      RampAudioRenderer.resample(
+        $0, channelCount: 1, ramp: constant, sourceSeconds: 0.2, sampleRate: 1000,
+        frames: 0..<200)
+    }
+
+    XCTAssertEqual(output.count, 200)
+    XCTAssertTrue(output[0..<99].allSatisfy { $0 == 1000 })
+    XCTAssertTrue(output[100...].allSatisfy { $0 == 0 })
+  }
+
+  /// The renderer writes a slice at a time; the slices join up to exactly
+  /// what one pass over the whole output gives.
+  func testResampleSlicesJoinUpToOnePass() {
+    let source = (0..<4000).map { Int16(truncatingIfNeeded: ($0 * 37) % 2001 - 1000) }
+    let render = { (frames: Range<Int>) in
+      source.withUnsafeBufferPointer {
+        RampAudioRenderer.resample(
+          $0, channelCount: 2, ramp: self.ramp, sourceSeconds: 2, sampleRate: 1000,
+          frames: frames)
+      }
+    }
+    let outputFrames = Int((2 * ramp.durationFactor * 1000).rounded())
+
+    let whole = render(0..<outputFrames)
+    let sliced = render(0..<777) + render(777..<1900) + render(1900..<outputFrames)
+    XCTAssertEqual(whole.count, outputFrames * 2)
+    XCTAssertEqual(sliced, whole)
+  }
+}
+
+// MARK: - Bitrate-capped AAC
+
+/// The AAC bitrate the bitrate-capped writer asks for has to lie in the
+/// encoder's range for the source's sample rate and channel count; 128 kbps at
+/// 22.05 kHz mono failed the whole render with -11861 (issue #255). The sample
+/// rate itself has to be one the encoder takes.
+final class BitrateCappedAACTests: XCTestCase {
+
+  func testAacBitrateKeeps128kWhereTheEncoderTakesIt() {
+    XCTAssertEqual(BitrateCappedExporter.aacBitrate(sampleRate: 48_000, channels: 2), 128_000)
+    XCTAssertEqual(BitrateCappedExporter.aacBitrate(sampleRate: 44_100, channels: 2), 128_000)
+    XCTAssertEqual(BitrateCappedExporter.aacBitrate(sampleRate: 44_100, channels: 1), 128_000)
+    XCTAssertEqual(BitrateCappedExporter.aacBitrate(sampleRate: 22_050, channels: 2), 128_000)
+  }
+
+  func testAacBitrateStaysInsideTheEncoderRange() {
+    XCTAssertEqual(BitrateCappedExporter.aacBitrate(sampleRate: 22_050, channels: 1), 64_000)
+    XCTAssertEqual(BitrateCappedExporter.aacBitrate(sampleRate: 32_000, channels: 1), 96_000)
+    XCTAssertEqual(BitrateCappedExporter.aacBitrate(sampleRate: 16_000, channels: 2), 96_000)
+    XCTAssertEqual(BitrateCappedExporter.aacBitrate(sampleRate: 8_000, channels: 1), 24_000)
+  }
+
+  func testAacSampleRateRoundsUpToAnEncoderRate() {
+    XCTAssertEqual(BitrateCappedExporter.aacSampleRate(for: 7_350), 8_000)
+    XCTAssertEqual(BitrateCappedExporter.aacSampleRate(for: 37_800), 44_100)
+    XCTAssertEqual(BitrateCappedExporter.aacSampleRate(for: 47_952), 48_000)
+    XCTAssertEqual(BitrateCappedExporter.aacSampleRate(for: 96_000), 48_000)
+    for rate in [8_000.0, 11_025, 12_000, 16_000, 22_050, 24_000, 32_000, 44_100, 48_000] {
+      XCTAssertEqual(BitrateCappedExporter.aacSampleRate(for: rate), rate)
+      // The encoder takes the rate: a converter for it can be built.
+      XCTAssertNotNil(
+        BitrateCappedExporter.aacBitrate(sampleRate: rate, channels: 1), "\(rate) Hz")
+    }
+  }
+
+  func testExportsLowSampleRateMonoAudio() async throws {
+    let stream = try await exportTone(sampleRate: 22_050)
+    XCTAssertEqual(stream.mFormatID, kAudioFormatMPEG4AAC)
+    XCTAssertEqual(stream.mSampleRate, 22_050)
+    XCTAssertEqual(stream.mChannelsPerFrame, 1)
+  }
+
+  /// 37.8 and 7.35 kHz are no AAC encoder rates. At the source rate the writer
+  /// input (37.8 kHz) and the reader output (7.35 kHz) raised an
+  /// `NSInvalidArgumentException` that crashed the app.
+  func testExportsAudioAtRatesTheEncoderLacks() async throws {
+    for (source, encoded) in [(37_800.0, 44_100.0), (7_350, 8_000)] {
+      let stream = try await exportTone(sampleRate: source)
+      XCTAssertEqual(stream.mFormatID, kAudioFormatMPEG4AAC, "\(source) Hz")
+      XCTAssertEqual(stream.mSampleRate, encoded, "\(source) Hz")
+      XCTAssertEqual(stream.mChannelsPerFrame, 1, "\(source) Hz")
+    }
+  }
+
+  /// Exports a 2 s clip with a mono 440 Hz tone at [sampleRate] through
+  /// `BitrateCappedExporter` and returns the output's audio format.
+  private func exportTone(sampleRate: Double) async throws -> AudioStreamBasicDescription {
+    let directory = FileManager.default.temporaryDirectory
+      .appendingPathComponent("aac-\(UUID().uuidString)")
+    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: directory) }
+
+    let palette = ThumbnailTimestampFixture.palette
+    let videoURL = try ThumbnailTimestampFixture.makeColorVideo(colors: [palette[0], palette[1]])
+    defer { try? FileManager.default.removeItem(at: videoURL) }
+    let audioURL = directory.appendingPathComponent("tone.caf")
+    let format = AVAudioFormat(standardFormatWithSampleRate: sampleRate, channels: 1)!
+    let frames = AVAudioFrameCount(sampleRate * 2)
+    let tone = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: frames)!
+    tone.frameLength = frames
+    for frame in 0..<Int(frames) {
+      tone.floatChannelData![0][frame] =
+        0.5 * sin(Float(frame) * 2 * .pi * 440 / Float(sampleRate))
+    }
+    try AVAudioFile(forWriting: audioURL, settings: format.settings).write(from: tone)
+
+    let video = AVURLAsset(url: videoURL)
+    let audio = AVURLAsset(url: audioURL)
+    let duration = try await video.load(.duration)
+    let range = CMTimeRange(start: .zero, duration: duration)
+    let composition = AVMutableComposition()
+    for (asset, type) in [(video, AVMediaType.video), (audio, .audio)] {
+      let track = composition.addMutableTrack(
+        withMediaType: type, preferredTrackID: kCMPersistentTrackID_Invalid)!
+      try track.insertTimeRange(
+        range, of: try await asset.loadTracks(withMediaType: type)[0], at: .zero)
+    }
+    let videoComposition = AVMutableVideoComposition(propertiesOf: composition)
+    videoComposition.renderSize = CGSize(width: 160, height: 90)
+
+    let output = directory.appendingPathComponent("capped.mp4")
+    try await BitrateCappedExporter.export(
+      asset: composition, videoComposition: videoComposition, audioMix: nil,
+      outputURL: output, fileType: .mp4, videoBitrate: 500_000, timeRange: nil,
+      optimizeForNetworkUse: false, onProgress: { _ in })
+
+    let track = try await AVURLAsset(url: output).loadTracks(withMediaType: .audio).first
+    let description = try await XCTUnwrap(track).load(.formatDescriptions).first
+    let stream = try XCTUnwrap(
+      CMAudioFormatDescriptionGetStreamBasicDescription(try XCTUnwrap(description)))
+    return stream.pointee
+  }
 }

@@ -2,12 +2,14 @@ package ch.waio.pro_video_editor.src.features.render
 
 import androidx.media3.common.Effect
 import androidx.media3.common.audio.AudioProcessor
-import applyAdjustment
 import applyBlur
 import applyColorMatrix
 import applyFlip
+import applyMaxFrameRate
 import applyPlaybackSpeed
 import applyRotation
+import applyCustomVideoEffects
+import applyVideoEffects
 import ch.waio.pro_video_editor.src.features.render.models.RenderConfig
 
 /**
@@ -31,12 +33,16 @@ class EffectsProcessor {
      * Processes the render configuration and builds effect pipelines.
      *
      * Effects are applied in the following order:
-     * 1. Rotation - Corrects video orientation
-     * 2. Flip - Horizontal/vertical mirroring
-     * 3. Scale - Resizes video dimensions
-     * 4. Color Matrix - Applies color transformations (filters, adjustments)
-     * 5. Blur - Applies blur effect
-     * 6. Playback Speed - Adjusts video/audio speed
+     * 1. Playback Speed - Adjusts video/audio speed
+     * 2. Frame Rate - Caps the output frame rate (drops surplus frames)
+     * 3. Rotation - Corrects video orientation
+     * 4. Flip - Horizontal/vertical mirroring
+     * 5. Custom Video Effects - Effects the app registered itself
+     * 6. Video Effects - Glitch, VHS, pixelate and other pixel effects
+     * 7. Color Matrix - Applies color transformations (filters, adjustments)
+     * 8. Blur - Applies blur effect
+     *
+     * Scale is applied later by VideoSequenceBuilder, after overlay and crop.
      *
      * @param config The render configuration containing effect parameters
      * @return ProcessedEffects containing lists of video and audio effects
@@ -48,15 +54,19 @@ class EffectsProcessor {
         // Calculate rotation degrees (4 - turns ensures correct direction)
         val rotationDegrees = (4 - (config.rotateTurns ?: 0)) * 90f
 
-        // Apply effects in order
+        // Speed first, so every effect after it times itself on the output
+        // timeline. The frame rate cap follows it, so it applies to that
+        // timeline and no later effect draws a frame it drops.
+        applyPlaybackSpeed(videoEffects, audioEffects, config.playbackSpeed)
+        applyMaxFrameRate(videoEffects, config.maxFrameRate)
         applyRotation(videoEffects, rotationDegrees)
         applyFlip(videoEffects, config.flipX, config.flipY)
         // Scale is NOT applied here — it is applied by VideoSequenceBuilder
         // AFTER overlay and crop to match the iOS/macOS pipeline order.
+        applyCustomVideoEffects(videoEffects, config.customEffects)
+        applyVideoEffects(videoEffects, config.effects)
         applyColorMatrix(videoEffects, config.colorFilters)
-        applyBlur(videoEffects, config.blur, config.blurFilters)
-        applyAdjustment(videoEffects, config.adjustment)
-        applyPlaybackSpeed(videoEffects, audioEffects, config.playbackSpeed)
+        applyBlur(videoEffects, config.blur)
 
         return ProcessedEffects(videoEffects, audioEffects)
     }
