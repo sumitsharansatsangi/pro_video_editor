@@ -37,21 +37,21 @@ extensions.configure<LibraryExtension>("android") {
 
     sourceSets {
         getByName("main") {
-            java.srcDir("src/main/kotlin")
+            java.directories.add("src/main/kotlin")
         }
 
         getByName("test") {
-            java.srcDir("src/test/kotlin")
+            java.directories.add("src/test/kotlin")
         }
     }
 
     testOptions {
         unitTests.isReturnDefaultValues = true
 
-        unitTests.all {
-            useJUnitPlatform()
+        unitTests.all { test: Test ->
+            test.useJUnitPlatform()
 
-            testLogging {
+            test.testLogging {
                 events(
                     "passed",
                     "skipped",
@@ -63,7 +63,7 @@ extensions.configure<LibraryExtension>("android") {
                 showStandardStreams = true
             }
 
-            outputs.upToDateWhen { false }
+            test.outputs.upToDateWhen { false }
         }
     }
 }
