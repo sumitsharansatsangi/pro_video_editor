@@ -45,8 +45,10 @@ fun resolveBitrateSettings(mimeType: String?, bitrate: Int?): BitrateChoice? {
     }
 
     val capabilities = codecInfo.getCapabilitiesForType(mimeType)
-    val bitrateRange = capabilities.videoCapabilities.bitrateRange
-    val supportsCBR = capabilities.encoderCapabilities
+    val videoCapabilities = capabilities.videoCapabilities ?: return null
+    val encoderCapabilities = capabilities.encoderCapabilities ?: return null
+    val bitrateRange = videoCapabilities.bitrateRange
+    val supportsCBR = encoderCapabilities
         .isBitrateModeSupported(MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_CBR)
 
     // Clamp the requested bitrate into the supported range instead of bailing

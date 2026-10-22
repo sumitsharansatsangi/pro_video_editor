@@ -12,7 +12,8 @@ kotlin {
 
 android {
     namespace = "com.example.pro_video_editor_example"
-    compileSdk = flutter.compileSdkVersion
+    // Keep the example app aligned with the plugin's Android API baseline.
+    compileSdk = 37
     ndkVersion = "29.0.14206865"
 
     compileOptions {
@@ -25,7 +26,7 @@ android {
         // You can update the following values to match your application needs.
         // For more information, see: https://flutter.dev/to/review-gradle-config.
         minSdk = 24
-        targetSdk = flutter.targetSdkVersion
+        targetSdk = 37
         versionCode = flutter.versionCode
         versionName = flutter.versionName
     }
